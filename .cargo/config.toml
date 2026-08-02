@@ -1,0 +1,24 @@
+# .cargo/config.toml — Project-level Cargo configuration
+#
+# PURPOSE: Locks the MSVC linker and Windows SDK library paths so that
+# `cargo build`/`cargo check` works in any terminal without needing to
+# manually invoke vcvarsall.bat first.
+#
+# ROOT CAUSE THIS FIXES:
+#   Git for Windows ships `C:\Program Files\Git\usr\bin\link.exe` (GNU linker)
+#   which appears earlier on PATH than the MSVC linker. The GNU linker rejects
+#   MSVC-style arguments with "extra operand". By pinning the linker here,
+#   Cargo bypasses PATH entirely for the linker lookup.
+#
+# HOW TO UPDATE:
+#   If you upgrade Visual Studio or the Windows SDK, update the paths below
+#   to match. Run `vswhere -latest ... -property installationPath` and
+#   check `C:\Program Files (x86)\Windows Kits\10\Lib\` for the new SDK version.
+
+[target.x86_64-pc-windows-msvc]
+linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Tools\\MSVC\\14.29.30133\\bin\\Hostx64\\x64\\link.exe"
+
+[env]
+# LIB tells the MSVC linker where to find system import libraries (kernel32.lib,
+# ucrt.lib, etc.). Normally set by vcvarsall.bat; we bake it in here permanently.
+LIB = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Tools\\MSVC\\14.29.30133\\lib\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.22621.0\\um\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.22621.0\\ucrt\\x64"

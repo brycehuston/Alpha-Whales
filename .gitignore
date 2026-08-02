@@ -1,0 +1,23 @@
+# Environment Variables (CRITICAL: DO NOT COMMIT PRIVATE KEYS)
+.env
+
+# Rust
+/target
+Cargo.lock
+
+# Databases & Logs
+*.db
+*.db-shm
+*.db-wal
+*.log
+trade_telemetry.db
+execution_journal.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

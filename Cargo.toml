@@ -1,0 +1,35 @@
+[package]
+name = "alpha-whales-bot"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "alpha-whales-bot"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.32", features = ["full"] }
+tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+solana-client = "2.1.0"
+solana-sdk = "2.1.0"
+spl-token = { version = "6.0.0", features = ["no-entrypoint"] }
+spl-token-2022 = { version = "4.0.0", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "4.0.0", features = ["no-entrypoint"] }
+bincode = "1.3"
+base64 = "0.21"
+bs58 = "0.5.1"
+thiserror = "1.0"
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = "0.4"
+lazy_static = "1.4"
+dotenvy = "0.15.7"
+crossbeam = "0.8"
+jito-protos = { git = "https://github.com/jito-labs/searcher-examples.git", rev = "f710c30b0ec7" }
+tonic = { version = "0.10", features = ["tls", "tls-roots"] }
+log = "0.4"
+env_logger = "0.11"
+axum = "0.7"
