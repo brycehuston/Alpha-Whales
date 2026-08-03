@@ -1,4 +1,5 @@
-use std::env;
+use std::{env, collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShadowStartupPolicy {
@@ -79,7 +80,7 @@ pub struct AppConfig {
     #[expect(dead_code, reason = "reserved for Phase 3+ runtime mode checks")]
     pub dry_run: bool,
     pub startup_policy: ShadowStartupPolicy,
-    pub watchlist: std::collections::HashMap<String, WhaleProfile>,
+    pub watchlist: Arc<RwLock<HashMap<String, WhaleProfile>>>,
 }
 
 impl AppConfig {
@@ -148,8 +149,27 @@ impl AppConfig {
             println!("LIVE EXECUTION MODE ENABLED: capital transmission is authorized.");
         }
 
-        let mut watchlist = std::collections::HashMap::new();
-        if let Ok(content) = std::fs::read_to_string("approved_watchlist.csv") {
+        let watchlist = Self::load_csv_watchlist("approved_watchlist.csv");
+        log::info!("Loaded {} approved whale wallets into memory", watchlist.len());
+
+        let watchlist_arc = Arc::new(RwLock::new(watchlist));
+
+        Ok(Self {
+            rpc_url,
+            raydium_ws_url,
+            target_mints: Some(vec![]),
+            min_swap_lamports: 10_000,
+            telegram_bot_token,
+            telegram_chat_id,
+            dry_run,
+            startup_policy,
+            watchlist: watchlist_arc,
+        })
+    }
+
+    pub fn load_csv_watchlist(path: &str) -> HashMap<String, WhaleProfile> {
+        let mut watchlist = HashMap::new();
+        if let Ok(content) = std::fs::read_to_string(path) {
             for (i, line) in content.lines().enumerate() {
                 if i == 0 || line.trim().is_empty() { continue; } // skip header and empty
                 let parts: Vec<&str> = line.split(',').collect();
@@ -178,19 +198,33 @@ impl AppConfig {
                 }
             }
         }
-        log::info!("Loaded {} approved whale wallets into memory", watchlist.len());
+        watchlist
+    }
+}
 
-        Ok(Self {
-            rpc_url,
-            raydium_ws_url,
-            target_mints: Some(vec![]),
-            min_swap_lamports: 10_000,
-            telegram_bot_token,
-            telegram_chat_id,
-            dry_run,
-            startup_policy,
-            watchlist,
-        })
+pub async fn spawn_hot_reloader(watchlist_arc: Arc<RwLock<HashMap<String, WhaleProfile>>>, path: String) {
+    log::info!("Starting Hot Reloader for {}", path);
+    let mut last_modified = std::time::SystemTime::UNIX_EPOCH;
+    
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            if let Ok(modified) = metadata.modified() {
+                if modified > last_modified {
+                    // Only reload if this isn't the first loop iteration
+                    if last_modified != std::time::SystemTime::UNIX_EPOCH {
+                        log::info!("[Hot-Reload] Detected changes in {}. Reloading...", path);
+                        let new_watchlist = AppConfig::load_csv_watchlist(&path);
+                        
+                        let mut write_lock = watchlist_arc.write().await;
+                        *write_lock = new_watchlist;
+                        log::info!("[Hot-Reload] Watchlist updated from disk! Loaded {} whales.", write_lock.len());
+                    }
+                    last_modified = modified;
+                }
+            }
+        }
     }
 }
 

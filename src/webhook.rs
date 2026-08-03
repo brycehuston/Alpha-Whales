@@ -8,12 +8,14 @@ use axum::{
 use serde::Deserialize;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::Sender;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct WebhookState {
     pub signal_tx: Sender<WhaleSignal>,
     pub api_key: String,
-    pub watchlist: std::collections::HashMap<String, crate::config::WhaleProfile>,
+    pub watchlist: Arc<RwLock<std::collections::HashMap<String, crate::config::WhaleProfile>>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -115,7 +117,8 @@ async fn handle_webhook(
             // Look up the whale in our dynamic sizing watchlist
             let mut trade_size_lamports = 10_000_000.0; // Default 0.01 SOL fallback
             
-            if let Some(profile) = state.watchlist.get(whale_wallet) {
+            let watchlist_read = state.watchlist.read().await;
+            if let Some(profile) = watchlist_read.get(whale_wallet) {
                 trade_size_lamports = match profile.lane {
                     crate::config::WhaleLane::Conservative => 100_000_000.0, // 0.1 SOL
                     crate::config::WhaleLane::Swing => 50_000_000.0, // 0.05 SOL
@@ -126,6 +129,7 @@ async fn handle_webhook(
             } else {
                 log::warn!("Wallet {} not found in watchlist. Using fallback size.", whale_wallet);
             }
+            drop(watchlist_read);
 
             let timestamp_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

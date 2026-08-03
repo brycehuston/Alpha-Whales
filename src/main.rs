@@ -321,7 +321,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut workers = JoinSet::<WorkerResult>::new();
     let tasks_spawned: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
-    // Phase 1 — Webhook Server Ingestion
+    // Phase 1 — Webhook Server Ingestion & Hot Reloading
+    tasks_spawned.fetch_add(1, Ordering::Relaxed);
+    let reloader_watchlist = config.watchlist.clone();
+    workers.spawn(async move {
+        config::spawn_hot_reloader(reloader_watchlist, "approved_watchlist.csv".to_string()).await;
+        Ok(())
+    });
+
     tasks_spawned.fetch_add(1, Ordering::Relaxed);
     let webhook_state = webhook::WebhookState {
         signal_tx,
