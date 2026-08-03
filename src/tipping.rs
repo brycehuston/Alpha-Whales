@@ -125,7 +125,13 @@ impl TipTelemetryEngine {
                         telemetry.p75_lamports,
                         telemetry.p95_lamports,
                     );
-                    *self.inner.telemetry.write().unwrap() = Some(telemetry);
+                    match self.inner.telemetry.write() {
+                        Ok(mut lock) => *lock = Some(telemetry),
+                        Err(poison) => {
+                            log::warn!("Recovering poisoned tip telemetry write lock");
+                            *poison.into_inner() = Some(telemetry);
+                        }
+                    }
                 }
                 Err(error) => {
                     log::warn!("Tip telemetry refresh failed: {error}; keeping previous snapshot");
@@ -162,7 +168,15 @@ impl TipTelemetryEngine {
         pre_tip_expected_profit_lamports: u64,
         now: Instant,
     ) -> TipDecision {
-        let telemetry = match *self.inner.telemetry.read().unwrap() {
+        let telemetry_guard = match self.inner.telemetry.read() {
+            Ok(guard) => guard,
+            Err(poison) => {
+                log::warn!("Recovering poisoned tip telemetry read lock");
+                poison.into_inner()
+            }
+        };
+        
+        let telemetry = match *telemetry_guard {
             Some(t) => t,
             None => {
                 return TipDecision::Skip {

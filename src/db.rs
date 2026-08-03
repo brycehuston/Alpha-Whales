@@ -142,28 +142,34 @@ pub fn log_trade_telemetry(
     market_cap_usd: f64,
     execution_status: &str,
 ) {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(conn) = lock.as_ref() {
-        let sql = "
-            INSERT INTO trade_logs (
-                wallet_address, token_mint, trade_direction, 
-                trade_size_sol, market_cap_usd, execution_status
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        ";
-        if let Err(e) = conn.execute(
-            sql,
-            params![
-                wallet_address,
-                token_mint,
-                trade_direction,
-                trade_size_sol,
-                market_cap_usd,
-                execution_status
-            ],
-        ) {
-            eprintln!("⚠️  Failed to insert trade log: {}", e);
+    let wallet_address = wallet_address.to_string();
+    let token_mint = token_mint.to_string();
+    let trade_direction = trade_direction.to_string();
+    let execution_status = execution_status.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = lock.as_ref() {
+            let sql = "
+                INSERT INTO trade_logs (
+                    wallet_address, token_mint, trade_direction, 
+                    trade_size_sol, market_cap_usd, execution_status
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ";
+            if let Err(e) = conn.execute(
+                sql,
+                params![
+                    wallet_address,
+                    token_mint,
+                    trade_direction,
+                    trade_size_sol,
+                    market_cap_usd,
+                    execution_status
+                ],
+            ) {
+                eprintln!("⚠️  Failed to insert trade log: {}", e);
+            }
         }
-    }
+    });
 }
 
 #[allow(dead_code)]
@@ -243,23 +249,29 @@ pub fn get_whale_history(wallet: &str, mint: &str) -> WhaleHistory {
 }
 
 pub fn insert_open_position(mint: &str) {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(conn) = lock.as_ref() {
-        let sql = "INSERT OR REPLACE INTO open_positions (token_mint) VALUES (?1)";
-        if let Err(e) = conn.execute(sql, params![mint]) {
-            eprintln!("⚠️  Failed to insert open position {}: {}", mint, e);
+    let mint = mint.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = lock.as_ref() {
+            let sql = "INSERT OR REPLACE INTO open_positions (token_mint) VALUES (?1)";
+            if let Err(e) = conn.execute(sql, params![mint]) {
+                eprintln!("⚠️  Failed to insert open position {}: {}", mint, e);
+            }
         }
-    }
+    });
 }
 
 pub fn remove_open_position(mint: &str) {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(conn) = lock.as_ref() {
-        let sql = "DELETE FROM open_positions WHERE token_mint = ?1";
-        if let Err(e) = conn.execute(sql, params![mint]) {
-            eprintln!("⚠️  Failed to remove open position {}: {}", mint, e);
+    let mint = mint.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = lock.as_ref() {
+            let sql = "DELETE FROM open_positions WHERE token_mint = ?1";
+            if let Err(e) = conn.execute(sql, params![mint]) {
+                eprintln!("⚠️  Failed to remove open position {}: {}", mint, e);
+            }
         }
-    }
+    });
 }
 
 #[allow(dead_code)]
@@ -292,34 +304,35 @@ pub fn record_landed_bundle(
     token_mint: &str,
     landed_slot: u64,
     transaction_signature: &str,
-) -> Result<(), String> {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    let conn = lock
-        .as_ref()
-        .ok_or_else(|| "database is unavailable".to_string())?;
-
-    // Insert or update the bundle record.
-    let sql = "
-        INSERT INTO bundles (bundle_id, region, token_mint, transaction_signature, landed_slot, landed_at, status)
-        VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, 'landed')
-        ON CONFLICT(bundle_id) DO UPDATE SET
-            landed_slot = excluded.landed_slot,
-            landed_at = CURRENT_TIMESTAMP,
-            status = 'landed'
-    ";
-    conn.execute(
-        sql,
-        params![
-            bundle_id,
-            region,
-            token_mint,
-            transaction_signature,
-            landed_slot
-        ],
-    )
-    .map_err(|e| format!("failed to record landed bundle: {e}"))?;
-
-    Ok(())
+) {
+    let bundle_id = bundle_id.to_string();
+    let region = region.to_string();
+    let token_mint = token_mint.to_string();
+    let transaction_signature = transaction_signature.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = match lock.as_ref() {
+            Some(c) => c,
+            None => {
+                log::error!("database is unavailable");
+                return;
+            }
+        };
+        let sql = "
+            INSERT INTO bundles (bundle_id, region, token_mint, transaction_signature, landed_slot, landed_at, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, 'landed')
+            ON CONFLICT(bundle_id) DO UPDATE SET
+                landed_slot = excluded.landed_slot,
+                landed_at = CURRENT_TIMESTAMP,
+                status = 'landed'
+        ";
+        if let Err(e) = conn.execute(
+            sql,
+            params![bundle_id, region, token_mint, transaction_signature, landed_slot],
+        ) {
+            log::error!("failed to record landed bundle: {e}");
+        }
+    });
 }
 
 #[allow(dead_code)]
@@ -338,47 +351,52 @@ pub fn record_position(
     entry_price_den: u128,
     tip_lamports: u64,
     pool_id: &str,
-) -> Result<(), String> {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    let conn = lock
-        .as_ref()
-        .ok_or_else(|| "database is unavailable".to_string())?;
+) {
+    let token_mint = token_mint.to_string();
+    let bundle_id = bundle_id.to_string();
+    let region = region.to_string();
+    let transaction_signature = transaction_signature.to_string();
+    let pool_id = pool_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = match lock.as_ref() {
+            Some(c) => c,
+            None => {
+                log::error!("database is unavailable");
+                return;
+            }
+        };
 
-    let entry_price_num_i64 = i64::try_from(entry_price_num.min(i64::MAX as u128))
-        .map_err(|_| "entry_price_num overflow".to_string())?;
-    let entry_price_den_i64 = i64::try_from(entry_price_den.min(i64::MAX as u128))
-        .map_err(|_| "entry_price_den overflow".to_string())?;
+        let entry_price_num_i64 = match i64::try_from(entry_price_num.min(i64::MAX as u128)) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let entry_price_den_i64 = match i64::try_from(entry_price_den.min(i64::MAX as u128)) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
-    let sql = "
-        INSERT OR REPLACE INTO positions (
-            token_mint, bundle_id, region, slot, transaction_signature,
-            amount_in_lamports, acquired_amount_raw,
-            entry_price_num, entry_price_den,
-            tip_lamports, pool_id, status
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active')
-    ";
-    conn.execute(
-        sql,
-        params![
-            token_mint,
-            bundle_id,
-            region,
-            slot,
-            transaction_signature,
-            amount_in_lamports,
-            acquired_amount_raw,
-            entry_price_num_i64,
-            entry_price_den_i64,
-            tip_lamports,
-            pool_id,
-        ],
-    )
-    .map_err(|e| format!("failed to record position: {e}"))?;
-
-    // Also record in the legacy open_positions table for backward compat.
-    insert_open_position(token_mint);
-
-    Ok(())
+        let sql = "
+            INSERT OR REPLACE INTO positions (
+                token_mint, bundle_id, region, slot, transaction_signature,
+                amount_in_lamports, acquired_amount_raw,
+                entry_price_num, entry_price_den,
+                tip_lamports, pool_id, status
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active')
+        ";
+        if let Err(e) = conn.execute(
+            sql,
+            params![
+                token_mint, bundle_id, region, slot, transaction_signature,
+                amount_in_lamports, acquired_amount_raw,
+                entry_price_num_i64, entry_price_den_i64,
+                tip_lamports, pool_id,
+            ],
+        ) {
+            log::error!("failed to record position: {e}");
+        }
+        insert_open_position(&token_mint);
+    });
 }
 
 /// Check whether the database connection is healthy and responsive.
@@ -414,28 +432,27 @@ pub fn check_db_healthy() -> bool {
     }
 }
 
-pub fn close_position(token_mint: &str) -> Result<(), String> {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    let conn = lock
-        .as_ref()
-        .ok_or_else(|| "database is unavailable".to_string())?;
-
-    let sql = "
-        UPDATE positions
-        SET status = 'closed', closed_at = CURRENT_TIMESTAMP
-        WHERE token_mint = ?1 AND status = 'active'
-    ";
-    let rows = conn
-        .execute(sql, params![token_mint])
-        .map_err(|e| format!("failed to close position: {e}"))?;
-
-    // Also remove from the legacy table.
-    remove_open_position(token_mint);
-
-    if rows == 0 {
-        return Err(format!("no active position found for mint {token_mint}"));
-    }
-    Ok(())
+pub fn close_position(token_mint: &str) {
+    let token_mint = token_mint.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = match lock.as_ref() {
+            Some(c) => c,
+            None => {
+                log::error!("database is unavailable");
+                return;
+            }
+        };
+        let sql = "
+            UPDATE positions
+            SET status = 'closed', closed_at = CURRENT_TIMESTAMP
+            WHERE token_mint = ?1 AND status = 'active'
+        ";
+        if let Err(e) = conn.execute(sql, params![&token_mint]) {
+            log::error!("failed to close position: {e}");
+        }
+        remove_open_position(&token_mint);
+    });
 }
 
 #[allow(dead_code)]
@@ -458,29 +475,32 @@ pub fn get_active_positions() -> Vec<String> {
 
 #[allow(dead_code)]
 /// Record a bundle as failed in the database.
-pub fn record_failed_bundle(bundle_id: &str, reason: &str) -> Result<(), String> {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    let conn = lock
-        .as_ref()
-        .ok_or_else(|| "database is unavailable".to_string())?;
-
-    let sql = "
-        UPDATE bundles
-        SET status = 'failed', failure_reason = ?1
-        WHERE bundle_id = ?2
-    ";
-    let rows = conn
-        .execute(sql, params![reason, bundle_id])
-        .map_err(|e| format!("failed to record failed bundle: {e}"))?;
-
-    if rows == 0 {
-        // Bundle wasn't in the table yet; insert a failed record.
-        let insert_sql = "
-            INSERT INTO bundles (bundle_id, status, failure_reason)
-            VALUES (?1, 'failed', ?2)
+pub fn record_failed_bundle(bundle_id: &str, reason: &str) {
+    let bundle_id = bundle_id.to_string();
+    let reason = reason.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = match lock.as_ref() {
+            Some(c) => c,
+            None => {
+                log::error!("database is unavailable");
+                return;
+            }
+        };
+        let sql = "
+            UPDATE bundles
+            SET status = 'failed', failure_reason = ?1
+            WHERE bundle_id = ?2
         ";
-        conn.execute(insert_sql, params![bundle_id, reason])
-            .map_err(|e| format!("failed to insert failed bundle: {e}"))?;
-    }
-    Ok(())
+        let rows = conn.execute(sql, params![&reason, &bundle_id]).unwrap_or(0);
+        if rows == 0 {
+            let insert_sql = "
+                INSERT INTO bundles (bundle_id, status, failure_reason)
+                VALUES (?1, 'failed', ?2)
+            ";
+            if let Err(e) = conn.execute(insert_sql, params![&bundle_id, &reason]) {
+                log::error!("failed to insert failed bundle: {e}");
+            }
+        }
+    });
 }

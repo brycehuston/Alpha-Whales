@@ -219,12 +219,7 @@ impl BundleTracker {
                     region
                 );
                 // Record the position in the local database
-                if let Err(e) = db::record_landed_bundle(bundle_id, &region, &mint, slot, &tx_sig) {
-                    log::error!(
-                        "[bundle_tracker] ⚠️ Failed to record landed bundle in DB: {}",
-                        e
-                    );
-                }
+                db::record_landed_bundle(bundle_id, &region, &mint, slot, &tx_sig);
             }
 
             // Notify the waiting execution consumer

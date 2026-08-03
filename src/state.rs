@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, Mutex as TokioMutex};
 
 // ============================================================================
 // MAX_CONCURRENT_POSITIONS — Open Position Concurrency Cap
@@ -74,10 +74,7 @@ pub struct BotState {
 
     /// Timestamp of the moment the circuit breaker first tripped.
     /// `None` when the breaker is not active or has been auto-reset.
-    /// Uses std::sync::Mutex (not tokio) because reads are fast and
-    /// is_circuit_breaker_active must remain a synchronous fn for use
-    /// in the hot websocket loop without .await overhead.
-    circuit_breaker_tripped_at: Mutex<Option<Instant>>,
+    circuit_breaker_tripped_at: TokioMutex<Option<Instant>>,
 }
 
 #[expect(
@@ -91,7 +88,7 @@ impl BotState {
             consecutive_losses: AtomicUsize::new(0),
             position_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_POSITIONS)),
             shadow_positions: RwLock::new(HashMap::new()),
-            circuit_breaker_tripped_at: Mutex::new(None),
+            circuit_breaker_tripped_at: TokioMutex::new(None),
         })
     }
 
@@ -216,27 +213,19 @@ impl BotState {
     /// - **Cooldown expired** (elapsed >= 30 min): Resets `consecutive_losses`
     ///   to 0, clears the timestamp, returns `false`. Trading resumes.
     ///   Logs a confirmation so operators know the bot self-recovered.
-    pub fn is_circuit_breaker_active(&self) -> bool {
+    pub async fn is_circuit_breaker_active(&self) -> bool {
         let losses = self.consecutive_losses.load(Ordering::SeqCst);
 
         if losses < CIRCUIT_BREAKER_THRESHOLD {
-            // Below threshold — clear the trip timer from any previous cycle.
-            let mut guard = self
-                .circuit_breaker_tripped_at
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = self.circuit_breaker_tripped_at.lock().await;
             *guard = None;
             return false;
         }
 
-        let mut guard = self
-            .circuit_breaker_tripped_at
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.circuit_breaker_tripped_at.lock().await;
 
         match *guard {
             None => {
-                // Circuit breaker tripping for the first time — record timestamp.
                 *guard = Some(Instant::now());
                 eprintln!(
                     "🔴 CIRCUIT BREAKER TRIPPED: {} consecutive stop-losses. \

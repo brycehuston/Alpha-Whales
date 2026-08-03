@@ -1,5 +1,5 @@
 use std::{env, collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShadowStartupPolicy {
@@ -56,6 +56,7 @@ pub enum WhaleLane {
     Conservative,
     Swing,
     Degen,
+    Sniper,
     Unknown,
 }
 
@@ -80,7 +81,7 @@ pub struct AppConfig {
     #[expect(dead_code, reason = "reserved for Phase 3+ runtime mode checks")]
     pub dry_run: bool,
     pub startup_policy: ShadowStartupPolicy,
-    pub watchlist: Arc<RwLock<HashMap<String, WhaleProfile>>>,
+    pub watchlist: Arc<DashMap<String, WhaleProfile>>,
 }
 
 impl AppConfig {
@@ -152,7 +153,7 @@ impl AppConfig {
         let watchlist = Self::load_csv_watchlist("approved_watchlist.csv");
         log::info!("Loaded {} approved whale wallets into memory", watchlist.len());
 
-        let watchlist_arc = Arc::new(RwLock::new(watchlist));
+        let watchlist_arc = Arc::new(watchlist.into_iter().collect::<DashMap<_, _>>());
 
         Ok(Self {
             rpc_url,
@@ -180,12 +181,22 @@ impl AppConfig {
                     let profit_factor = parts[3].parse::<f64>().unwrap_or(0.0);
                     let net_profit = parts[4].parse::<f64>().unwrap_or(0.0);
                     
-                    let lane = if win_rate >= 0.6 && profit_factor > 2.0 {
-                        WhaleLane::Conservative
-                    } else if win_rate < 0.4 && profit_factor > 2.0 {
-                        WhaleLane::Degen
-                    } else {
-                        WhaleLane::Swing
+                    let lane_str = if parts.len() > 5 { parts[5].trim() } else { "" };
+                    let lane = match lane_str {
+                        "Conservative" => WhaleLane::Conservative,
+                        "Swing" => WhaleLane::Swing,
+                        "Degen" => WhaleLane::Degen,
+                        "Sniper" => WhaleLane::Sniper,
+                        _ => {
+                            // Fallback if lane is missing
+                            if win_rate >= 0.6 && profit_factor > 2.0 {
+                                WhaleLane::Conservative
+                            } else if win_rate < 0.4 && profit_factor > 2.0 {
+                                WhaleLane::Degen
+                            } else {
+                                WhaleLane::Swing
+                            }
+                        }
                     };
 
                     watchlist.insert(wallet, WhaleProfile {
@@ -202,7 +213,7 @@ impl AppConfig {
     }
 }
 
-pub async fn spawn_hot_reloader(watchlist_arc: Arc<RwLock<HashMap<String, WhaleProfile>>>, path: String) {
+pub async fn spawn_hot_reloader(watchlist_arc: Arc<DashMap<String, WhaleProfile>>, path: String) {
     log::info!("Starting Hot Reloader for {}", path);
     let mut last_modified = std::time::SystemTime::UNIX_EPOCH;
     
@@ -217,9 +228,11 @@ pub async fn spawn_hot_reloader(watchlist_arc: Arc<RwLock<HashMap<String, WhaleP
                         log::info!("[Hot-Reload] Detected changes in {}. Reloading...", path);
                         let new_watchlist = AppConfig::load_csv_watchlist(&path);
                         
-                        let mut write_lock = watchlist_arc.write().await;
-                        *write_lock = new_watchlist;
-                        log::info!("[Hot-Reload] Watchlist updated from disk! Loaded {} whales.", write_lock.len());
+                        watchlist_arc.clear();
+                        for (k, v) in new_watchlist {
+                            watchlist_arc.insert(k, v);
+                        }
+                        log::info!("[Hot-Reload] Watchlist updated from disk! Loaded {} whales.", watchlist_arc.len());
                     }
                     last_modified = modified;
                 }

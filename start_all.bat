@@ -1,0 +1,6 @@
+@echo off
+echo 🧠 Starting WhaleSignalLab Brain Daemon...
+start cmd /k "cd /d D:\FruxLabs\WhaleSignalLab && title BrainDaemon && python brain_daemon.py"
+
+echo 🐳 Starting Alpha-Whales Rust Engine...
+wsl bash -l -c "cd /mnt/c/FruxLabs/Alpha-Whales && cargo run"

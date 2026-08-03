@@ -28,7 +28,7 @@
 use crate::{
     db,
     execution::{construct_raydium_swap_instruction, MINIMUM_JITO_TIP_LAMPORTS},
-    pool_cache::{resolve_pool_keys, RaydiumPoolKeys, WSOL_MINT},
+    pool_cache::{RaydiumPoolKeys, WSOL_MINT},
     state::BotState,
     types::SwapEvent,
 };
@@ -158,6 +158,8 @@ pub struct ActivePosition {
     pub mint: String,
     /// Source pool ID used for execution — used to filter price ticks.
     pub source_pool_id: String,
+    /// Pool keys used for the exit, pre-resolved during the buy phase.
+    pub pool_keys: RaydiumPoolKeys,
     /// Entry price: WSOL lamports received per token raw unit at buy time.
     /// Computed as `wsol_out_lamports / token_in_raw`.
     /// Stored as (numerator, denominator) to avoid precision loss.
@@ -172,6 +174,10 @@ pub struct ActivePosition {
     pub block_engine_url: String,
     /// The timestamp in milliseconds when the position was acquired.
     pub entry_timestamp_ms: u64,
+    /// Jito don't front pubkey for MEV protection on the sell side.
+    pub jito_dont_front_pubkey: solana_sdk::pubkey::Pubkey,
+    /// Max slippage basis points for the exit swap.
+    pub max_slippage_bps: u16,
 }
 
 // ============================================================================
@@ -335,18 +341,7 @@ async fn run_watcher(
         position.mint, position.acquired_amount
     );
 
-    // Resolve the Raydium pool keys once. We need them to build the sell
-    // instruction. If resolution fails, we cannot execute any sell.
-    let pool_keys = match resolve_pool_keys(rpc_client.as_ref(), &position.mint).await {
-        Ok(keys) => keys,
-        Err(err) => {
-            eprintln!(
-                "[exits] 🚨 Pool resolution failed for {}: {}. Aborting watcher.",
-                position.mint, err
-            );
-            return;
-        }
-    };
+    let pool_keys = position.pool_keys.clone();
 
     println!(
         "[exits] ✅ Pool keys resolved for {} (amm_id={}).",
@@ -547,10 +542,52 @@ async fn run_watcher(
                 telegram_bot_token.clone(),
                 telegram_chat_id.clone(),
                 true, // is_final_exit
+                cur_wsol_num,
+                cur_wsol_den,
             )
             .await;
             return;
         }
+        // ====================================================================
+        // EXIT CONDITION VWAP — Mean-Reversion Snapback (Breakeven/Profit)
+        // ====================================================================
+        // current_price >= entry_price
+        let is_snapback = cur_wsol_num
+            .checked_mul(position.entry_price_wsol_den)
+            .and_then(|lhs| {
+                position
+                    .entry_price_wsol_num
+                    .checked_mul(cur_wsol_den)
+                    .map(|rhs| lhs >= rhs)
+            })
+            .unwrap_or(false);
+
+        if is_snapback {
+            println!(
+                "[exits] 🎯 VWAP SNAPBACK: Price fully recovered to entry for {}. \
+                 Executing full sell to lock in breakeven/profit.",
+                position.mint
+            );
+            execute_sell_with_retry(
+                "VWAP_SNAPBACK",
+                &position,
+                &pool_keys,
+                mint_pubkey,
+                rpc_client.clone(),
+                payer.clone(),
+                bot_state.clone(),
+                dry_run,
+                &http_client,
+                telegram_bot_token.clone(),
+                telegram_chat_id.clone(),
+                true, // is_final_exit
+                cur_wsol_num,
+                cur_wsol_den,
+            )
+            .await;
+            return;
+        }
+
         // ====================================================================
         // EXIT CONDITION A — Adaptive Partial Exit (50% Scale-Out)
         // ====================================================================
@@ -572,7 +609,7 @@ async fn run_watcher(
             let mut partial_position = position.clone();
             partial_position.acquired_amount = partial_amount;
 
-            execute_sell_with_retry(
+            let success = execute_sell_with_retry(
                 "ADAPTIVE_SCALE_OUT_50PCT",
                 &partial_position,
                 &pool_keys,
@@ -585,12 +622,16 @@ async fn run_watcher(
                 telegram_bot_token.clone(),
                 telegram_chat_id.clone(),
                 false, // is_final_exit
+                cur_wsol_num,
+                cur_wsol_den,
             )
             .await;
 
-            // Reduce our local tracked bag by the amount sold so the trailing stop sells the rest
-            position.acquired_amount -= partial_amount;
-            partial_sold = true;
+            if success {
+                // Reduce our local tracked bag ONLY IF the sell actually landed on chain
+                position.acquired_amount -= partial_amount;
+                partial_sold = true;
+            }
             continue;
         }
 
@@ -677,6 +718,8 @@ async fn run_watcher(
                     telegram_bot_token.clone(),
                     telegram_chat_id.clone(),
                     true, // is_final_exit
+                    cur_wsol_num,
+                    cur_wsol_den,
                 )
                 .await;
                 return;
@@ -716,7 +759,9 @@ async fn execute_sell_with_retry(
     telegram_bot_token: Option<String>,
     telegram_chat_id: Option<String>,
     is_final_exit: bool,
-) {
+    cur_wsol_num: u128,
+    cur_wsol_den: u128,
+) -> bool {
     if dry_run {
         println!(
             "[exits] 💸 [DRY RUN] Sell triggered ({}) for {}. No bundle dispatched.",
@@ -730,30 +775,57 @@ async fn execute_sell_with_retry(
                 released, position.mint
             );
         }
-        return;
+        return true;
     }
 
-    let result = attempt_sell_bundle(position, pool_keys, mint_pubkey, rpc_client, payer).await;
+    let expected_wsol = (position.acquired_amount as u128)
+        .checked_mul(cur_wsol_num)
+        .unwrap_or(0) / cur_wsol_den.max(1);
+    let minimum_amount_out = crate::execution::calculate_local_minimum_amount_out(
+        expected_wsol as u64,
+        position.max_slippage_bps,
+    ).unwrap_or(1);
+
+    let result = attempt_sell_bundle(
+        position, pool_keys, mint_pubkey, rpc_client.clone(), payer, minimum_amount_out
+    ).await;
 
     match result {
-        Ok(bundle_id) => {
+        Ok((bundle_id, signature)) => {
             println!(
                 "[exits] ✅ Sell bundle ACCEPTED ({}) for {} | bundle_id={}.",
                 reason, position.mint, bundle_id
             );
+            println!("[exits] ⏳ Waiting for on-chain confirmation of signature: {}", signature);
+
+            let mut confirmed = false;
+            for _ in 0..15 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Ok(response) = rpc_client.get_signature_statuses(&[signature]).await {
+                    if let Some(Some(status)) = response.value.first() {
+                        if status.satisfies_commitment(solana_sdk::commitment_config::CommitmentConfig { commitment: solana_sdk::commitment_config::CommitmentLevel::Confirmed }) {
+                            if status.err.is_none() {
+                                confirmed = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !confirmed {
+                eprintln!("[exits] 🚨 Sell bundle {} was accepted but DID NOT CONFIRM on-chain.", bundle_id);
+                return false;
+            }
+
+            println!("[exits] ✅ Sell transaction CONFIRMED on-chain!");
 
             // ---- Phase 6: Close Position in Database -----------------------
             //
             // Record the exit in the SQLite positions table so the operator
             // has a complete PnL record across the full trade lifecycle.
             if is_final_exit {
-                if let Err(e) = db::close_position(&position.mint) {
-                    log::error!(
-                        "[Phase 6] ⚠️ Failed to close position in database for {}: {}",
-                        position.mint,
-                        e,
-                    );
-                }
+                db::close_position(&position.mint);
 
                 // Release the shadow position lock now that we have bundle acceptance.
                 // Note: bundle acceptance ≠ on-chain confirmation, but Jito blocks
@@ -815,8 +887,10 @@ async fn execute_sell_with_retry(
             );
             // Do NOT release the shadow position — leave it as a sentinel so
             // the operator knows this mint is in an unresolved state.
+            return false;
         }
     }
+    true
 }
 
 /// Executes the full sell pipeline: build instruction → sign bundle → submit.
@@ -827,7 +901,8 @@ async fn attempt_sell_bundle(
     mint_pubkey: Pubkey,
     rpc_client: Arc<RpcClient>,
     payer: Arc<Keypair>,
-) -> Result<String, ExitError> {
+    minimum_amount_out: u64,
+) -> Result<(String, solana_sdk::signature::Signature), ExitError> {
     // Derive ATAs for the sell: source = token ATA, destination = WSOL ATA.
     let user_owner = payer.pubkey();
     let user_source_token_account =
@@ -893,16 +968,13 @@ async fn attempt_sell_bundle(
         };
 
         // Build the sell instruction: Token → WSOL.
-        // minimum_amount_out = 1 (accept any output; slippage risk is
-        // accepted in panic/stop scenarios — correctness > price).
-        // In mean-reversion exits the price has recovered so slippage is low.
-        let swap_ix = match construct_raydium_swap_instruction(
+        let mut swap_ix = match construct_raydium_swap_instruction(
             pool_keys,
             user_owner,
             user_source_token_account,
             user_destination_wsol_account,
             position.acquired_amount,
-            1, // minimum_amount_out — see note above
+            minimum_amount_out,
         ) {
             Ok(ix) => ix,
             Err(err) => {
@@ -911,6 +983,10 @@ async fn attempt_sell_bundle(
                 )));
             }
         };
+
+        if let Err(e) = crate::execution::apply_jitodontfront_protection(&mut swap_ix, position.jito_dont_front_pubkey) {
+            eprintln!("[exits] ⚠️ Failed to apply MEV protection: {}", e);
+        }
 
         // Select the next tip account (round-robin).
         let tip_account = jito.tip_accounts[jito.next_tip_index];
@@ -972,7 +1048,8 @@ async fn attempt_sell_bundle(
                     eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
                     continue;
                 }
-                return Ok(bundle_id);
+                let sig = transaction.signatures[0];
+                return Ok((bundle_id, sig));
             }
             Ok(Err(status)) => {
                 last_error = format!("gRPC status: {status}");

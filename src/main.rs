@@ -193,6 +193,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = config::AppConfig::load_from_env()?;
 
+    // -----------------------------------------------------------------------
+    // Master Process Bootstrapper: The Brain Daemon
+    // -----------------------------------------------------------------------
+    // The Rust Engine acts as the master process and automatically spawns the
+    // Python WhaleSignalLab daemon in the background to ensure continuous 
+    // telemetry and watchlist updates.
+    let daemon_path = std::env::var("BRAIN_DAEMON_PATH")
+        .unwrap_or_else(|_| "D:\\FruxLabs\\WhaleSignalLab\\brain_daemon.py".to_string());
+    let daemon_cwd = std::env::var("BRAIN_DAEMON_CWD")
+        .unwrap_or_else(|_| "/mnt/d/FruxLabs/WhaleSignalLab".to_string());
+
+    match std::process::Command::new("python.exe")
+        .arg(&daemon_path)
+        .current_dir(&daemon_cwd)
+        .spawn()
+    {
+        Ok(_) => log::info!("🧠 Python Brain Daemon spawned successfully in the background!"),
+        Err(e) => log::error!("⚠️ Failed to spawn Python Brain Daemon: {}", e),
+    }
+
     // ---- Telegram Startup Alert ------------------------------
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -332,7 +352,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tasks_spawned.fetch_add(1, Ordering::Relaxed);
     let webhook_state = webhook::WebhookState {
         signal_tx,
-        api_key: std::env::var("WEBHOOK_API_KEY").unwrap_or_else(|_| "supersecret".to_string()),
+        api_key: std::env::var("WEBHOOK_API_KEY").unwrap_or_else(|_| {
+            log::error!("CRITICAL: WEBHOOK_API_KEY is missing from environment! Refusing to start with default key.");
+            std::process::exit(1);
+        }),
         watchlist: config.watchlist.clone(),
     };
     workers.spawn(async move {
@@ -451,7 +474,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             
             
             
-            let cb = health_state.is_circuit_breaker_active();
+            let cb = health_state.is_circuit_breaker_active().await;
             let open_pos = health_state.open_position_count();
             let notifications_received = websocket::NOTIFICATIONS_RECEIVED.load(Ordering::Relaxed);
             let swaps_decoded = websocket::SWAPS_DECODED.load(Ordering::Relaxed);

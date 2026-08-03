@@ -165,7 +165,7 @@ pub enum BundleProtectionError {
 /// validate the *total* account count, so trailing accounts beyond the
 /// documented layout are ignored by the program and safe to append. Any
 /// other program_id is rejected until similarly proven.
-pub fn apply_jitodontfront_protection(
+pub(crate) fn apply_jitodontfront_protection(
     instruction: &mut Instruction,
     sentinel: Pubkey,
 ) -> Result<(), ShieldError> {
@@ -1076,9 +1076,9 @@ struct PreparedSwap {
     instructions: Vec<Instruction>,
     destination_ata_rent_lamports: u64,
     /// Resolved ALT for this pool, if `config.alt_address` is configured
-    /// and the on-chain fetch succeeded. `None` = fall back to no-ALT
     /// legacy message (no compression).
     alt: Option<AddressLookupTableAccount>,
+    pool_keys: crate::pool_cache::RaydiumPoolKeys,
 }
 
 async fn resolve_swap_instructions_for_signal(
@@ -1247,6 +1247,7 @@ async fn resolve_swap_instructions_for_signal(
         instructions,
         destination_ata_rent_lamports,
         alt,
+        pool_keys,
     })
 }
 
@@ -1349,7 +1350,7 @@ fn validate_quote(
     Ok(minimum_amount_out)
 }
 
-fn calculate_local_minimum_amount_out(
+pub(crate) fn calculate_local_minimum_amount_out(
     quoted_output: u64,
     max_slippage_bps: u16,
 ) -> Result<u64, JitoExecutionError> {
@@ -1457,7 +1458,7 @@ pub async fn run_whale_execution_consumer(
 
     while let Some(signal) = signal_rx.recv().await {
         // ---- Circuit Breaker Gate ------------------------------------------
-        if bot_state.is_circuit_breaker_active() {
+        if bot_state.is_circuit_breaker_active().await {
             continue;
         }
 
@@ -1544,6 +1545,7 @@ pub async fn run_whale_execution_consumer(
             instructions,
             destination_ata_rent_lamports,
             alt,
+            pool_keys,
         } = prepared;
 
         // ---- Phase 3 Tip Gate (MASTER_PLAN.md Section 3) -----------------
@@ -1686,19 +1688,13 @@ pub async fn run_whale_execution_consumer(
                             bundle_region = Some(record.region.clone());
 
                             // Record the landed bundle in the database.
-                            if let Err(e) = db::record_landed_bundle(
+                            db::record_landed_bundle(
                                 &record.bundle_id,
                                 &record.region,
                                 &record.mint,
                                 record.status.slot().unwrap_or(0),
                                 &record.transaction_signature,
-                            ) {
-                                log::error!(
-                                    "[Phase 6] ⚠️ Failed to DB-record landed bundle {}: {}",
-                                    record.bundle_id,
-                                    e,
-                                );
-                            }
+                            );
                         }
                         Ok(None) => {
                             log::warn!(
@@ -1743,6 +1739,7 @@ pub async fn run_whale_execution_consumer(
                     &tx_signature_string,
                     prepared_target_mint,
                     pool_id.clone(),
+                    pool_keys.clone(),
                     &config,
                     rpc_client.clone(),
                     payer.clone(),
@@ -1830,6 +1827,7 @@ async fn confirm_and_handoff(
     tx_signature_str: &str,
     target_mint: Pubkey,
     pool_id: String,
+    pool_keys: crate::pool_cache::RaydiumPoolKeys,
     config: &JitoExecutorConfig,
     rpc_client: Arc<RpcClient>,
     payer: Arc<Keypair>,
@@ -1927,6 +1925,7 @@ async fn confirm_and_handoff(
     let position = ActivePosition {
         mint: signal.target_mint.clone(),
         source_pool_id: pool_id.clone(),
+        pool_keys,
         entry_price_wsol_num: dynamic_amount_in as u128,
         entry_price_wsol_den: acquired_amount as u128,
 
@@ -1934,6 +1933,8 @@ async fn confirm_and_handoff(
         jito_tip_lamports: config.tip_lamports,
         block_engine_url: config.block_engine_url.clone(),
         entry_timestamp_ms: signal.timestamp_ms,
+        jito_dont_front_pubkey: config.jito_dont_front_pubkey,
+        max_slippage_bps: config.max_slippage_bps,
     };
 
     // ---- Phase 6: Record Position in Database -------------------------------
@@ -1942,7 +1943,7 @@ async fn confirm_and_handoff(
     // and so the sell-side close function can update the record on exit.
     let slot = bundle_slot.unwrap_or(0);
     let region_str = bundle_region.as_deref().unwrap_or("unknown");
-    if let Err(e) = db::record_position(
+    db::record_position(
         &position.mint,
         "", // bundle_id — set from tracker record in a follow-up
         region_str,
@@ -1954,13 +1955,7 @@ async fn confirm_and_handoff(
         position.entry_price_wsol_den,
         position.jito_tip_lamports,
         &position.source_pool_id,
-    ) {
-        log::error!(
-            "[Phase 6] ⚠️ Failed to record position in database for {}: {}",
-            signal.target_mint,
-            e,
-        );
-    }
+    );
 
     // ---- Create per-watcher price feed via broadcast → mpsc adapter --------
     //

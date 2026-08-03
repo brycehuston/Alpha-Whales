@@ -9,13 +9,13 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::Sender;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 
 #[derive(Clone)]
 pub struct WebhookState {
     pub signal_tx: Sender<WhaleSignal>,
     pub api_key: String,
-    pub watchlist: Arc<RwLock<std::collections::HashMap<String, crate::config::WhaleProfile>>>,
+    pub watchlist: Arc<DashMap<String, crate::config::WhaleProfile>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -24,6 +24,7 @@ pub struct HeliusWebhookPayload {
     pub event_type: String,
     #[serde(rename = "feePayer")]
     pub fee_payer: String,
+    pub timestamp: u64,
     pub events: Option<HeliusEvents>,
 }
 
@@ -117,24 +118,20 @@ async fn handle_webhook(
             // Look up the whale in our dynamic sizing watchlist
             let mut trade_size_lamports = 10_000_000.0; // Default 0.01 SOL fallback
             
-            let watchlist_read = state.watchlist.read().await;
-            if let Some(profile) = watchlist_read.get(whale_wallet) {
+            if let Some(profile) = state.watchlist.get(whale_wallet) {
                 trade_size_lamports = match profile.lane {
-                    crate::config::WhaleLane::Conservative => 100_000_000.0, // 0.1 SOL
-                    crate::config::WhaleLane::Swing => 50_000_000.0, // 0.05 SOL
-                    crate::config::WhaleLane::Degen => 20_000_000.0, // 0.02 SOL
+                    crate::config::WhaleLane::Conservative => 30_000_000.0, // 0.03 SOL
+                    crate::config::WhaleLane::Swing => 20_000_000.0,       // 0.02 SOL
+                    crate::config::WhaleLane::Degen => 10_000_000.0,       // 0.01 SOL
+                    crate::config::WhaleLane::Sniper => 50_000_000.0,      // 0.05 SOL (Highest confidence)
                     _ => 10_000_000.0, // 0.01 SOL
                 };
                 log::info!("🐋 Whale Lane: {:?} | Dynamically sized trade to {} lamports", profile.lane, trade_size_lamports);
             } else {
                 log::warn!("Wallet {} not found in watchlist. Using fallback size.", whale_wallet);
             }
-            drop(watchlist_read);
 
-            let timestamp_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let timestamp_ms = trade.timestamp * 1000;
 
             let signal = WhaleSignal {
                 target_mint: token_mint.clone(),
