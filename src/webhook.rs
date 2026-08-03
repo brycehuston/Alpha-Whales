@@ -6,8 +6,7 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
-use solana_sdk::pubkey::Pubkey;
-use std::{net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
+use std::net::SocketAddr;
 use tokio::sync::mpsc::Sender;
 
 #[derive(Clone)]
@@ -32,6 +31,7 @@ pub struct HeliusEvents {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 pub struct HeliusSwap {
     #[serde(rename = "nativeInput")]
     pub native_input: Option<HeliusNativeInput>,
@@ -40,6 +40,7 @@ pub struct HeliusSwap {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 pub struct HeliusNativeInput {
     pub amount: String,
 }
@@ -84,12 +85,26 @@ async fn handle_webhook(
         return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
     }
 
+    log::info!("📡 Helius Webhook Received! Processing {} transaction(s)...", payload.len());
+
     for trade in payload {
-        if trade.event_type != "SWAP" { continue; }
+        if trade.event_type != "SWAP" { 
+            log::info!("   [Skip] Ignored transaction from {}: Event is {} (Not a SWAP)", trade.fee_payer, trade.event_type);
+            continue; 
+        }
         
-        let Some(events) = trade.events else { continue };
-        let Some(swap) = events.swap else { continue };
-        let Some(token_outputs) = swap.token_outputs else { continue };
+        let Some(events) = trade.events else { 
+            log::info!("   [Skip] Ignored SWAP from {}: Missing 'events' data", trade.fee_payer);
+            continue; 
+        };
+        let Some(swap) = events.swap else { 
+            log::info!("   [Skip] Ignored SWAP from {}: Missing 'swap' payload", trade.fee_payer);
+            continue; 
+        };
+        let Some(token_outputs) = swap.token_outputs else { 
+            log::info!("   [Skip] Ignored SWAP from {}: Missing 'tokenOutputs' (Probably a sell or no tokens received)", trade.fee_payer);
+            continue; 
+        };
         
         if let Some(output) = token_outputs.first() {
             let token_mint = &output.mint;

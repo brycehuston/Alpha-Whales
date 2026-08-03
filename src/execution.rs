@@ -62,8 +62,6 @@ const RAYDIUM_SWAP_BASE_IN_DATA_LEN: usize = 17;
 const MAXIMUM_SLIPPAGE_BPS: u16 = 500;
 const MAX_QUOTE_RESPONSE_BYTES: usize = 64 * 1024;
 const RAYDIUM_QUOTE_URL: &str = "https://transaction-v1.raydium.io/compute/swap-base-in";
-const DEVIATION_NUMERATOR: u128 = 17;
-const DEVIATION_DENOMINATOR: u128 = 20;
 const BASIS_POINTS_DENOMINATOR: u128 = 10_000;
 const EXECUTION_JOURNAL_VERSION: u8 = 1;
 const MAX_EXECUTION_JOURNAL_BYTES: usize = 1024 * 1024;
@@ -241,7 +239,6 @@ pub struct JitoExecutorConfig {
     pub request_timeout: Duration,
     #[allow(dead_code)]
     pub reconnect_delay: Duration,
-    pub amount_in: u64,
     pub max_slippage_bps: u16,
     pub max_signal_age: Duration,
     pub max_pending_capital_lamports: u64,
@@ -269,7 +266,6 @@ impl JitoExecutorConfig {
         tip_lamports: u64,
         request_timeout: Duration,
         reconnect_delay: Duration,
-        amount_in: u64,
         max_slippage_bps: u16,
         max_signal_age: Duration,
         max_pending_capital_lamports: u64,
@@ -296,11 +292,6 @@ impl JitoExecutorConfig {
                 "Jito reconnect delay must be non-zero".to_string(),
             ));
         }
-        if amount_in == 0 {
-            return Err(JitoExecutionError::InvalidConfiguration(
-                "trade amount must be greater than zero".to_string(),
-            ));
-        }
         if !(1..=MAXIMUM_SLIPPAGE_BPS).contains(&max_slippage_bps) {
             return Err(JitoExecutionError::InvalidConfiguration(format!(
                 "max slippage must be between 1 and {MAXIMUM_SLIPPAGE_BPS} basis points"
@@ -310,17 +301,6 @@ impl JitoExecutorConfig {
             return Err(JitoExecutionError::InvalidConfiguration(
                 "maximum signal age must be non-zero".to_string(),
             ));
-        }
-        let minimum_capital_per_attempt = amount_in.checked_add(tip_lamports).ok_or_else(|| {
-            JitoExecutionError::InvalidConfiguration(
-                "per-attempt capital reservation overflowed".to_string(),
-            )
-        })?;
-        if max_pending_capital_lamports < minimum_capital_per_attempt {
-            return Err(JitoExecutionError::InvalidConfiguration(format!(
-                "pending capital ceiling must exceed trade plus tip ({minimum_capital_per_attempt} \
-                 lamports); exact transaction fee and ATA rent are enforced at runtime"
-            )));
         }
         if !execution_journal_path.is_absolute() {
             return Err(JitoExecutionError::InvalidConfiguration(
@@ -339,7 +319,6 @@ impl JitoExecutorConfig {
             tip_lamports,
             request_timeout,
             reconnect_delay,
-            amount_in,
             max_slippage_bps,
             max_signal_age,
             max_pending_capital_lamports,
@@ -360,6 +339,7 @@ impl JitoExecutorConfig {
 }
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum JitoExecutionError {
     #[error("invalid Jito executor configuration: {0}")]
     InvalidConfiguration(String),
@@ -627,11 +607,12 @@ impl ExecutionJournal {
         config: &JitoExecutorConfig,
         signed_bundle: &SignedBundle,
     ) -> Result<(), JitoExecutionError> {
+        let dynamic_amount_in = (signal.trade_size_sol * 1_000_000_000.0) as u64;
         if self.contains(&target_mint) {
             return Err(JitoExecutionError::DuplicateExecutionAttempt);
         }
         let capital_at_risk_lamports = capital_at_risk_lamports(
-            config.amount_in,
+            dynamic_amount_in,
             config.tip_lamports,
             signed_bundle.transaction_fee_lamports,
             destination_ata_rent_lamports,
@@ -648,7 +629,7 @@ impl ExecutionJournal {
         self.append(&ExecutionJournalRecord::Reserved {
             version: EXECUTION_JOURNAL_VERSION,
             target_mint: target_mint.to_string(),
-            amount_in: config.amount_in,
+            amount_in: dynamic_amount_in,
             capital_at_risk_lamports,
             timestamp_ms: signal.timestamp_ms,
             transaction_signature: signed_bundle.transaction_signature.clone(),
@@ -1114,6 +1095,7 @@ async fn resolve_swap_instructions_for_signal(
             "target mint must differ from WSOL".to_string(),
         ));
     }
+    let dynamic_amount_in = (signal.trade_size_sol * 1_000_000_000.0) as u64;
 
 
     let user_owner = payer.pubkey();
@@ -1128,7 +1110,7 @@ async fn resolve_swap_instructions_for_signal(
             .await
             .map_err(JitoExecutionError::from)
     };
-    let quote_future = fetch_raydium_quote(target_mint, config);
+    let quote_future = fetch_raydium_quote(target_mint, dynamic_amount_in, config);
     let user_accounts_future = async {
         rpc_client
             .get_multiple_accounts(&user_account_addresses)
@@ -1172,7 +1154,7 @@ async fn resolve_swap_instructions_for_signal(
         "WSOL source",
         WSOL_MINT,
         user_owner,
-        config.amount_in,
+        dynamic_amount_in,
         true,
     )?;
 
@@ -1219,13 +1201,13 @@ async fn resolve_swap_instructions_for_signal(
         }
     };
 
-    let minimum_amount_out = validate_quote(&quote, &pool_keys, signal, config)?;
+    let minimum_amount_out = validate_quote(&quote, &pool_keys, signal, config, dynamic_amount_in)?;
     let mut swap_instruction = construct_raydium_swap_instruction(
         &pool_keys,
         user_owner,
         user_source_token_account,
         user_destination_token_account,
-        config.amount_in,
+        dynamic_amount_in,
         minimum_amount_out,
     )?;
     // Phase 2 (MASTER_PLAN.md Section 2): attach the Jito anti-sandwich
@@ -1270,6 +1252,7 @@ async fn resolve_swap_instructions_for_signal(
 
 async fn fetch_raydium_quote(
     target_mint: Pubkey,
+    dynamic_amount_in: u64,
     config: &JitoExecutorConfig,
 ) -> Result<QuoteData, JitoExecutionError> {
     let client = reqwest::Client::builder()
@@ -1283,7 +1266,7 @@ async fn fetch_raydium_quote(
         .query(&[
             ("inputMint", WSOL_MINT.to_string()),
             ("outputMint", target_mint.to_string()),
-            ("amount", config.amount_in.to_string()),
+            ("amount", dynamic_amount_in.to_string()),
             ("slippageBps", config.max_slippage_bps.to_string()),
             ("txVersion", "V0".to_string()),
         ])
@@ -1320,6 +1303,7 @@ fn validate_quote(
     pool_keys: &RaydiumPoolKeys,
     signal: &WhaleSignal,
     config: &JitoExecutorConfig,
+    dynamic_amount_in: u64,
 ) -> Result<u64, JitoExecutionError> {
     if quote.swap_type != "BaseIn"
         || quote.input_mint != WSOL_MINT.to_string()
@@ -1336,7 +1320,7 @@ fn validate_quote(
         parse_quote_amount("otherAmountThreshold", &quote.other_amount_threshold)?;
     let local_minimum_amount_out =
         calculate_local_minimum_amount_out(quoted_output, config.max_slippage_bps)?;
-    if quoted_input != config.amount_in
+    if quoted_input != dynamic_amount_in
         || quoted_output == 0
         || api_minimum_amount_out == 0
         || local_minimum_amount_out == 0
@@ -1537,6 +1521,7 @@ pub async fn run_whale_execution_consumer(
             continue;
         }
 
+        let dynamic_amount_in = (signal.trade_size_sol * 1_000_000_000.0) as u64;
         let prepared = match resolve_swap_instructions_for_signal(
             &signal,
             rpc_client.as_ref(),
@@ -1562,7 +1547,7 @@ pub async fn run_whale_execution_consumer(
         } = prepared;
 
         // ---- Phase 3 Tip Gate (MASTER_PLAN.md Section 3) -----------------
-        let pre_tip_profit = config.amount_in / 100;
+        let pre_tip_profit = dynamic_amount_in / 100;
         let tip_decision =
             tip_engine.calculate_tip(pre_tip_profit, tokio::time::Instant::now().into_std());
         let tip_lamports = match tip_decision {
@@ -1786,7 +1771,7 @@ pub async fn run_whale_execution_consumer(
                             let client_clone = http_client.clone();
                             let mint_str = signal.target_mint.clone();
                             let sig_str = tx_signature_string.clone();
-                            let trade_size = format!("Bot Trade: {} SOL", (config.amount_in as f64) / 1_000_000_000.0);
+                            let trade_size = format!("Bot Trade: {} SOL", (dynamic_amount_in as f64) / 1_000_000_000.0);
                             tokio::spawn(async move {
                                 crate::telegram::send_telegram_alert(
                                     &client_clone,
@@ -1858,6 +1843,7 @@ async fn confirm_and_handoff(
     telegram_bot_token: Option<String>,
     telegram_chat_id: Option<String>,
 ) -> Result<(), JitoExecutionError> {
+    let dynamic_amount_in = (signal.trade_size_sol * 1_000_000_000.0) as u64;
     // ---- Parse the transaction signature -----------------------------------
     let tx_signature = Signature::from_str(tx_signature_str).map_err(|err| {
         JitoExecutionError::ConfirmationFailed(
@@ -1941,7 +1927,7 @@ async fn confirm_and_handoff(
     let position = ActivePosition {
         mint: signal.target_mint.clone(),
         source_pool_id: pool_id.clone(),
-        entry_price_wsol_num: config.amount_in as u128,
+        entry_price_wsol_num: dynamic_amount_in as u128,
         entry_price_wsol_den: acquired_amount as u128,
 
         acquired_amount,
@@ -1962,7 +1948,7 @@ async fn confirm_and_handoff(
         region_str,
         slot,
         tx_signature_str,
-        config.amount_in,
+        dynamic_amount_in,
         acquired_amount,
         position.entry_price_wsol_num,
         position.entry_price_wsol_den,

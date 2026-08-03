@@ -122,15 +122,6 @@ fn required_pubkey(name: &'static str) -> Result<solana_sdk::pubkey::Pubkey, err
 }
 
 fn load_live_executor_config() -> Result<execution::JitoExecutorConfig, error::BotError> {
-    let amount_in = required_u64("TRADE_AMOUNT_LAMPORTS")?;
-    let capital_ceiling = required_u64("MAX_TRADE_AMOUNT_LAMPORTS")?;
-    if amount_in == 0 || capital_ceiling == 0 || amount_in > capital_ceiling {
-        return Err(error::BotError::ConfigError(
-            "TRADE_AMOUNT_LAMPORTS must be non-zero and no greater than \
-             MAX_TRADE_AMOUNT_LAMPORTS"
-                .to_string(),
-        ));
-    }
 
     let max_slippage_bps = u16::try_from(required_u64("MAX_SLIPPAGE_BPS")?).map_err(|error| {
         error::BotError::ConfigError(format!("MAX_SLIPPAGE_BPS is out of range: {error}"))
@@ -154,7 +145,6 @@ fn load_live_executor_config() -> Result<execution::JitoExecutorConfig, error::B
         execution::MINIMUM_JITO_TIP_LAMPORTS,
         Duration::from_secs(10),
         Duration::from_secs(2),
-        amount_in,
         max_slippage_bps,
         Duration::from_millis(max_signal_age_ms),
         max_pending_capital_lamports,

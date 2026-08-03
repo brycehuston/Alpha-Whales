@@ -50,6 +50,7 @@ pub fn startup_policy(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum WhaleLane {
     Conservative,
     Swing,
@@ -58,6 +59,7 @@ pub enum WhaleLane {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct WhaleProfile {
     pub total_trades: u32,
     pub win_rate: f64,
@@ -131,18 +133,7 @@ impl AppConfig {
             println!("⚠️  TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — alerts disabled.");
         }
 
-        let target_mints = env::var("TARGET_MINTS")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| {
-                s.split(',')
-                    .map(|mint| mint.trim().to_string())
-                    .filter(|mint| !mint.is_empty())
-                    .collect::<Vec<String>>()
-            })
-            .filter(|v| !v.is_empty());
-
-        let min_swap_lamports = match env::var("MIN_SWAP_LAMPORTS") {
+        let _min_swap_lamports = match env::var("MIN_SWAP_LAMPORTS") {
             Ok(val) => val.trim().parse::<u64>().map_err(|error| {
                 crate::error::BotError::ConfigError(format!(
                     "MIN_SWAP_LAMPORTS must be an unsigned integer: {error}"
