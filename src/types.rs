@@ -24,6 +24,7 @@ pub struct WhaleSignal {
     pub whale_wallet: String,
     pub trade_size_sol: f64,
     pub timestamp_ms: u64,
+    pub lane: crate::config::WhaleLane,
 }
 
 

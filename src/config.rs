@@ -135,13 +135,17 @@ impl AppConfig {
             println!("⚠️  TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — alerts disabled.");
         }
 
-        let _min_swap_lamports = match env::var("MIN_SWAP_LAMPORTS") {
+        // BUGFIX (Critical #2, audit 2026-08): this value was parsed and
+        // validated but then discarded — the struct below hardcoded
+        // `min_swap_lamports: 10_000` regardless of what the operator set.
+        // Now actually threaded through.
+        let min_swap_lamports = match env::var("MIN_SWAP_LAMPORTS") {
             Ok(val) => val.trim().parse::<u64>().map_err(|error| {
                 crate::error::BotError::ConfigError(format!(
                     "MIN_SWAP_LAMPORTS must be an unsigned integer: {error}"
                 ))
             })?,
-            Err(_) => 0,
+            Err(_) => 10_000,
         };
 
         if dry_run {
@@ -158,8 +162,21 @@ impl AppConfig {
         Ok(Self {
             rpc_url,
             raydium_ws_url,
-            target_mints: Some(vec![]),
-            min_swap_lamports: 10_000,
+            // BUGFIX (Critical #1, audit 2026-08): this was previously
+            // `Some(vec![])`, which is NOT equivalent to "no filter" under
+            // `Option::is_none_or` in websocket.rs::configured_target_matches
+            // — `Some(vec![])` runs `.any()` against an empty iterator,
+            // which is always `false`. Every decoded swap was therefore
+            // silently routed into FILTER_DROPS and never reached the exit
+            // watchers, leaving every live position with zero VWAP/trailing
+            // stop/panic-velocity protection. `None` is the actual "accept
+            // every mint" sentinel this codebase has no env wiring to
+            // override yet; `configured_target_matches` also now treats an
+            // empty `Some(vec![])` as unrestricted so this class of bug
+            // can't resurface if target-mint filtering is wired to an env
+            // var later and left unset/empty.
+            target_mints: None,
+            min_swap_lamports,
             telegram_bot_token,
             telegram_chat_id,
             dry_run,

@@ -72,7 +72,7 @@ impl Default for TipConfig {
             tip_floor_url: "https://bundles.jito.wtf/api/v1/bundles/tip_floor".to_string(),
             refresh_interval: Duration::from_secs(30),
             max_telemetry_age: Duration::from_secs(120),
-            max_profit_share_bps: 2500,
+            max_profit_share_bps: 5000,
             minimum_net_profit_lamports: 0,
         }
     }

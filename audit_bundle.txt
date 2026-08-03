@@ -227,12 +227,7 @@ impl BundleTracker {
                     region
                 );
                 // Record the position in the local database
-                if let Err(e) = db::record_landed_bundle(bundle_id, &region, &mint, slot, &tx_sig) {
-                    log::error!(
-                        "[bundle_tracker] ⚠️ Failed to record landed bundle in DB: {}",
-                        e
-                    );
-                }
+                db::record_landed_bundle(bundle_id, &region, &mint, slot, &tx_sig);
             }
 
             // Notify the waiting execution consumer
@@ -819,7 +814,7 @@ FILE: c:/FruxLabs/Alpha-Whales/src\config.rs
 ================================================================================
 
 use std::{env, collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShadowStartupPolicy {
@@ -901,7 +896,7 @@ pub struct AppConfig {
     #[expect(dead_code, reason = "reserved for Phase 3+ runtime mode checks")]
     pub dry_run: bool,
     pub startup_policy: ShadowStartupPolicy,
-    pub watchlist: Arc<RwLock<HashMap<String, WhaleProfile>>>,
+    pub watchlist: Arc<DashMap<String, WhaleProfile>>,
 }
 
 impl AppConfig {
@@ -973,7 +968,7 @@ impl AppConfig {
         let watchlist = Self::load_csv_watchlist("approved_watchlist.csv");
         log::info!("Loaded {} approved whale wallets into memory", watchlist.len());
 
-        let watchlist_arc = Arc::new(RwLock::new(watchlist));
+        let watchlist_arc = Arc::new(watchlist.into_iter().collect::<DashMap<_, _>>());
 
         Ok(Self {
             rpc_url,
@@ -1033,7 +1028,7 @@ impl AppConfig {
     }
 }
 
-pub async fn spawn_hot_reloader(watchlist_arc: Arc<RwLock<HashMap<String, WhaleProfile>>>, path: String) {
+pub async fn spawn_hot_reloader(watchlist_arc: Arc<DashMap<String, WhaleProfile>>, path: String) {
     log::info!("Starting Hot Reloader for {}", path);
     let mut last_modified = std::time::SystemTime::UNIX_EPOCH;
     
@@ -1048,9 +1043,11 @@ pub async fn spawn_hot_reloader(watchlist_arc: Arc<RwLock<HashMap<String, WhaleP
                         log::info!("[Hot-Reload] Detected changes in {}. Reloading...", path);
                         let new_watchlist = AppConfig::load_csv_watchlist(&path);
                         
-                        let mut write_lock = watchlist_arc.write().await;
-                        *write_lock = new_watchlist;
-                        log::info!("[Hot-Reload] Watchlist updated from disk! Loaded {} whales.", write_lock.len());
+                        watchlist_arc.clear();
+                        for (k, v) in new_watchlist {
+                            watchlist_arc.insert(k, v);
+                        }
+                        log::info!("[Hot-Reload] Watchlist updated from disk! Loaded {} whales.", watchlist_arc.len());
                     }
                     last_modified = modified;
                 }
@@ -1246,28 +1243,34 @@ pub fn log_trade_telemetry(
     market_cap_usd: f64,
     execution_status: &str,
 ) {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(conn) = lock.as_ref() {
-        let sql = "
-            INSERT INTO trade_logs (
-                wallet_address, token_mint, trade_direction, 
-                trade_size_sol, market_cap_usd, execution_status
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        ";
-        if let Err(e) = conn.execute(
-            sql,
-            params![
-                wallet_address,
-                token_mint,
-                trade_direction,
-                trade_size_sol,
-                market_cap_usd,
-                execution_status
-            ],
-        ) {
-            eprintln!("⚠️  Failed to insert trade log: {}", e);
+    let wallet_address = wallet_address.to_string();
+    let token_mint = token_mint.to_string();
+    let trade_direction = trade_direction.to_string();
+    let execution_status = execution_status.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = lock.as_ref() {
+            let sql = "
+                INSERT INTO trade_logs (
+                    wallet_address, token_mint, trade_direction, 
+                    trade_size_sol, market_cap_usd, execution_status
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ";
+            if let Err(e) = conn.execute(
+                sql,
+                params![
+                    wallet_address,
+                    token_mint,
+                    trade_direction,
+                    trade_size_sol,
+                    market_cap_usd,
+                    execution_status
+                ],
+            ) {
+                eprintln!("⚠️  Failed to insert trade log: {}", e);
+            }
         }
-    }
+    });
 }
 
 #[allow(dead_code)]
@@ -1347,23 +1350,29 @@ pub fn get_whale_history(wallet: &str, mint: &str) -> WhaleHistory {
 }
 
 pub fn insert_open_position(mint: &str) {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(conn) = lock.as_ref() {
-        let sql = "INSERT OR REPLACE INTO open_positions (token_mint) VALUES (?1)";
-        if let Err(e) = conn.execute(sql, params![mint]) {
-            eprintln!("⚠️  Failed to insert open position {}: {}", mint, e);
+    let mint = mint.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = lock.as_ref() {
+            let sql = "INSERT OR REPLACE INTO open_positions (token_mint) VALUES (?1)";
+            if let Err(e) = conn.execute(sql, params![mint]) {
+                eprintln!("⚠️  Failed to insert open position {}: {}", mint, e);
+            }
         }
-    }
+    });
 }
 
 pub fn remove_open_position(mint: &str) {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(conn) = lock.as_ref() {
-        let sql = "DELETE FROM open_positions WHERE token_mint = ?1";
-        if let Err(e) = conn.execute(sql, params![mint]) {
-            eprintln!("⚠️  Failed to remove open position {}: {}", mint, e);
+    let mint = mint.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = lock.as_ref() {
+            let sql = "DELETE FROM open_positions WHERE token_mint = ?1";
+            if let Err(e) = conn.execute(sql, params![mint]) {
+                eprintln!("⚠️  Failed to remove open position {}: {}", mint, e);
+            }
         }
-    }
+    });
 }
 
 #[allow(dead_code)]
@@ -1396,34 +1405,35 @@ pub fn record_landed_bundle(
     token_mint: &str,
     landed_slot: u64,
     transaction_signature: &str,
-) -> Result<(), String> {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    let conn = lock
-        .as_ref()
-        .ok_or_else(|| "database is unavailable".to_string())?;
-
-    // Insert or update the bundle record.
-    let sql = "
-        INSERT INTO bundles (bundle_id, region, token_mint, transaction_signature, landed_slot, landed_at, status)
-        VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, 'landed')
-        ON CONFLICT(bundle_id) DO UPDATE SET
-            landed_slot = excluded.landed_slot,
-            landed_at = CURRENT_TIMESTAMP,
-            status = 'landed'
-    ";
-    conn.execute(
-        sql,
-        params![
-            bundle_id,
-            region,
-            token_mint,
-            transaction_signature,
-            landed_slot
-        ],
-    )
-    .map_err(|e| format!("failed to record landed bundle: {e}"))?;
-
-    Ok(())
+) {
+    let bundle_id = bundle_id.to_string();
+    let region = region.to_string();
+    let token_mint = token_mint.to_string();
+    let transaction_signature = transaction_signature.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = match lock.as_ref() {
+            Some(c) => c,
+            None => {
+                log::error!("database is unavailable");
+                return;
+            }
+        };
+        let sql = "
+            INSERT INTO bundles (bundle_id, region, token_mint, transaction_signature, landed_slot, landed_at, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, 'landed')
+            ON CONFLICT(bundle_id) DO UPDATE SET
+                landed_slot = excluded.landed_slot,
+                landed_at = CURRENT_TIMESTAMP,
+                status = 'landed'
+        ";
+        if let Err(e) = conn.execute(
+            sql,
+            params![bundle_id, region, token_mint, transaction_signature, landed_slot],
+        ) {
+            log::error!("failed to record landed bundle: {e}");
+        }
+    });
 }
 
 #[allow(dead_code)]
@@ -1442,47 +1452,52 @@ pub fn record_position(
     entry_price_den: u128,
     tip_lamports: u64,
     pool_id: &str,
-) -> Result<(), String> {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    let conn = lock
-        .as_ref()
-        .ok_or_else(|| "database is unavailable".to_string())?;
+) {
+    let token_mint = token_mint.to_string();
+    let bundle_id = bundle_id.to_string();
+    let region = region.to_string();
+    let transaction_signature = transaction_signature.to_string();
+    let pool_id = pool_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = match lock.as_ref() {
+            Some(c) => c,
+            None => {
+                log::error!("database is unavailable");
+                return;
+            }
+        };
 
-    let entry_price_num_i64 = i64::try_from(entry_price_num.min(i64::MAX as u128))
-        .map_err(|_| "entry_price_num overflow".to_string())?;
-    let entry_price_den_i64 = i64::try_from(entry_price_den.min(i64::MAX as u128))
-        .map_err(|_| "entry_price_den overflow".to_string())?;
+        let entry_price_num_i64 = match i64::try_from(entry_price_num.min(i64::MAX as u128)) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let entry_price_den_i64 = match i64::try_from(entry_price_den.min(i64::MAX as u128)) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
-    let sql = "
-        INSERT OR REPLACE INTO positions (
-            token_mint, bundle_id, region, slot, transaction_signature,
-            amount_in_lamports, acquired_amount_raw,
-            entry_price_num, entry_price_den,
-            tip_lamports, pool_id, status
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active')
-    ";
-    conn.execute(
-        sql,
-        params![
-            token_mint,
-            bundle_id,
-            region,
-            slot,
-            transaction_signature,
-            amount_in_lamports,
-            acquired_amount_raw,
-            entry_price_num_i64,
-            entry_price_den_i64,
-            tip_lamports,
-            pool_id,
-        ],
-    )
-    .map_err(|e| format!("failed to record position: {e}"))?;
-
-    // Also record in the legacy open_positions table for backward compat.
-    insert_open_position(token_mint);
-
-    Ok(())
+        let sql = "
+            INSERT OR REPLACE INTO positions (
+                token_mint, bundle_id, region, slot, transaction_signature,
+                amount_in_lamports, acquired_amount_raw,
+                entry_price_num, entry_price_den,
+                tip_lamports, pool_id, status
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active')
+        ";
+        if let Err(e) = conn.execute(
+            sql,
+            params![
+                token_mint, bundle_id, region, slot, transaction_signature,
+                amount_in_lamports, acquired_amount_raw,
+                entry_price_num_i64, entry_price_den_i64,
+                tip_lamports, pool_id,
+            ],
+        ) {
+            log::error!("failed to record position: {e}");
+        }
+        insert_open_position(&token_mint);
+    });
 }
 
 /// Check whether the database connection is healthy and responsive.
@@ -1518,28 +1533,27 @@ pub fn check_db_healthy() -> bool {
     }
 }
 
-pub fn close_position(token_mint: &str) -> Result<(), String> {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    let conn = lock
-        .as_ref()
-        .ok_or_else(|| "database is unavailable".to_string())?;
-
-    let sql = "
-        UPDATE positions
-        SET status = 'closed', closed_at = CURRENT_TIMESTAMP
-        WHERE token_mint = ?1 AND status = 'active'
-    ";
-    let rows = conn
-        .execute(sql, params![token_mint])
-        .map_err(|e| format!("failed to close position: {e}"))?;
-
-    // Also remove from the legacy table.
-    remove_open_position(token_mint);
-
-    if rows == 0 {
-        return Err(format!("no active position found for mint {token_mint}"));
-    }
-    Ok(())
+pub fn close_position(token_mint: &str) {
+    let token_mint = token_mint.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = match lock.as_ref() {
+            Some(c) => c,
+            None => {
+                log::error!("database is unavailable");
+                return;
+            }
+        };
+        let sql = "
+            UPDATE positions
+            SET status = 'closed', closed_at = CURRENT_TIMESTAMP
+            WHERE token_mint = ?1 AND status = 'active'
+        ";
+        if let Err(e) = conn.execute(sql, params![&token_mint]) {
+            log::error!("failed to close position: {e}");
+        }
+        remove_open_position(&token_mint);
+    });
 }
 
 #[allow(dead_code)]
@@ -1562,31 +1576,34 @@ pub fn get_active_positions() -> Vec<String> {
 
 #[allow(dead_code)]
 /// Record a bundle as failed in the database.
-pub fn record_failed_bundle(bundle_id: &str, reason: &str) -> Result<(), String> {
-    let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
-    let conn = lock
-        .as_ref()
-        .ok_or_else(|| "database is unavailable".to_string())?;
-
-    let sql = "
-        UPDATE bundles
-        SET status = 'failed', failure_reason = ?1
-        WHERE bundle_id = ?2
-    ";
-    let rows = conn
-        .execute(sql, params![reason, bundle_id])
-        .map_err(|e| format!("failed to record failed bundle: {e}"))?;
-
-    if rows == 0 {
-        // Bundle wasn't in the table yet; insert a failed record.
-        let insert_sql = "
-            INSERT INTO bundles (bundle_id, status, failure_reason)
-            VALUES (?1, 'failed', ?2)
+pub fn record_failed_bundle(bundle_id: &str, reason: &str) {
+    let bundle_id = bundle_id.to_string();
+    let reason = reason.to_string();
+    tokio::task::spawn_blocking(move || {
+        let lock = DB_CONN.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = match lock.as_ref() {
+            Some(c) => c,
+            None => {
+                log::error!("database is unavailable");
+                return;
+            }
+        };
+        let sql = "
+            UPDATE bundles
+            SET status = 'failed', failure_reason = ?1
+            WHERE bundle_id = ?2
         ";
-        conn.execute(insert_sql, params![bundle_id, reason])
-            .map_err(|e| format!("failed to insert failed bundle: {e}"))?;
-    }
-    Ok(())
+        let rows = conn.execute(sql, params![&reason, &bundle_id]).unwrap_or(0);
+        if rows == 0 {
+            let insert_sql = "
+                INSERT INTO bundles (bundle_id, status, failure_reason)
+                VALUES (?1, 'failed', ?2)
+            ";
+            if let Err(e) = conn.execute(insert_sql, params![&bundle_id, &reason]) {
+                log::error!("failed to insert failed bundle: {e}");
+            }
+        }
+    });
 }
 
 
@@ -2513,7 +2530,7 @@ pub enum BundleProtectionError {
 /// validate the *total* account count, so trailing accounts beyond the
 /// documented layout are ignored by the program and safe to append. Any
 /// other program_id is rejected until similarly proven.
-pub fn apply_jitodontfront_protection(
+pub(crate) fn apply_jitodontfront_protection(
     instruction: &mut Instruction,
     sentinel: Pubkey,
 ) -> Result<(), ShieldError> {
@@ -3424,9 +3441,9 @@ struct PreparedSwap {
     instructions: Vec<Instruction>,
     destination_ata_rent_lamports: u64,
     /// Resolved ALT for this pool, if `config.alt_address` is configured
-    /// and the on-chain fetch succeeded. `None` = fall back to no-ALT
     /// legacy message (no compression).
     alt: Option<AddressLookupTableAccount>,
+    pool_keys: crate::pool_cache::RaydiumPoolKeys,
 }
 
 async fn resolve_swap_instructions_for_signal(
@@ -3595,6 +3612,7 @@ async fn resolve_swap_instructions_for_signal(
         instructions,
         destination_ata_rent_lamports,
         alt,
+        pool_keys,
     })
 }
 
@@ -3697,7 +3715,7 @@ fn validate_quote(
     Ok(minimum_amount_out)
 }
 
-fn calculate_local_minimum_amount_out(
+pub(crate) fn calculate_local_minimum_amount_out(
     quoted_output: u64,
     max_slippage_bps: u16,
 ) -> Result<u64, JitoExecutionError> {
@@ -3805,7 +3823,7 @@ pub async fn run_whale_execution_consumer(
 
     while let Some(signal) = signal_rx.recv().await {
         // ---- Circuit Breaker Gate ------------------------------------------
-        if bot_state.is_circuit_breaker_active() {
+        if bot_state.is_circuit_breaker_active().await {
             continue;
         }
 
@@ -3869,12 +3887,21 @@ pub async fn run_whale_execution_consumer(
             continue;
         }
 
+        let mut signal_config = config.clone();
+        signal_config.max_slippage_bps = match signal.lane {
+            crate::config::WhaleLane::Sniper => 250, // 2.5%
+            crate::config::WhaleLane::Degen => 200,  // 2.0%
+            crate::config::WhaleLane::Swing => 150,  // 1.5%
+            crate::config::WhaleLane::Conservative => 100, // 1.0%
+            _ => config.max_slippage_bps,
+        };
+
         let dynamic_amount_in = (signal.trade_size_sol * 1_000_000_000.0) as u64;
         let prepared = match resolve_swap_instructions_for_signal(
             &signal,
             rpc_client.as_ref(),
             &payer,
-            &config,
+            &signal_config,
         )
         .await
         {
@@ -3892,6 +3919,7 @@ pub async fn run_whale_execution_consumer(
             instructions,
             destination_ata_rent_lamports,
             alt,
+            pool_keys,
         } = prepared;
 
         // ---- Phase 3 Tip Gate (MASTER_PLAN.md Section 3) -----------------
@@ -3962,7 +3990,7 @@ pub async fn run_whale_execution_consumer(
                 &signal,
                 prepared_target_mint,
                 destination_ata_rent_lamports,
-                &config,
+                &signal_config,
                 &signed_bundle,
             )
             .await?;
@@ -4034,19 +4062,13 @@ pub async fn run_whale_execution_consumer(
                             bundle_region = Some(record.region.clone());
 
                             // Record the landed bundle in the database.
-                            if let Err(e) = db::record_landed_bundle(
+                            db::record_landed_bundle(
                                 &record.bundle_id,
                                 &record.region,
                                 &record.mint,
                                 record.status.slot().unwrap_or(0),
                                 &record.transaction_signature,
-                            ) {
-                                log::error!(
-                                    "[Phase 6] ⚠️ Failed to DB-record landed bundle {}: {}",
-                                    record.bundle_id,
-                                    e,
-                                );
-                            }
+                            );
                         }
                         Ok(None) => {
                             log::warn!(
@@ -4091,7 +4113,8 @@ pub async fn run_whale_execution_consumer(
                     &tx_signature_string,
                     prepared_target_mint,
                     pool_id.clone(),
-                    &config,
+                    pool_keys.clone(),
+                    &signal_config,
                     rpc_client.clone(),
                     payer.clone(),
                     bot_state.clone(),
@@ -4178,6 +4201,7 @@ async fn confirm_and_handoff(
     tx_signature_str: &str,
     target_mint: Pubkey,
     pool_id: String,
+    pool_keys: crate::pool_cache::RaydiumPoolKeys,
     config: &JitoExecutorConfig,
     rpc_client: Arc<RpcClient>,
     payer: Arc<Keypair>,
@@ -4275,6 +4299,7 @@ async fn confirm_and_handoff(
     let position = ActivePosition {
         mint: signal.target_mint.clone(),
         source_pool_id: pool_id.clone(),
+        pool_keys,
         entry_price_wsol_num: dynamic_amount_in as u128,
         entry_price_wsol_den: acquired_amount as u128,
 
@@ -4282,6 +4307,8 @@ async fn confirm_and_handoff(
         jito_tip_lamports: config.tip_lamports,
         block_engine_url: config.block_engine_url.clone(),
         entry_timestamp_ms: signal.timestamp_ms,
+        jito_dont_front_pubkey: config.jito_dont_front_pubkey,
+        max_slippage_bps: config.max_slippage_bps,
     };
 
     // ---- Phase 6: Record Position in Database -------------------------------
@@ -4290,7 +4317,7 @@ async fn confirm_and_handoff(
     // and so the sell-side close function can update the record on exit.
     let slot = bundle_slot.unwrap_or(0);
     let region_str = bundle_region.as_deref().unwrap_or("unknown");
-    if let Err(e) = db::record_position(
+    db::record_position(
         &position.mint,
         "", // bundle_id — set from tracker record in a follow-up
         region_str,
@@ -4302,13 +4329,7 @@ async fn confirm_and_handoff(
         position.entry_price_wsol_den,
         position.jito_tip_lamports,
         &position.source_pool_id,
-    ) {
-        log::error!(
-            "[Phase 6] ⚠️ Failed to record position in database for {}: {}",
-            signal.target_mint,
-            e,
-        );
-    }
+    );
 
     // ---- Create per-watcher price feed via broadcast → mpsc adapter --------
     //
@@ -5117,7 +5138,7 @@ FILE: c:/FruxLabs/Alpha-Whales/src\exits.rs
 use crate::{
     db,
     execution::{construct_raydium_swap_instruction, MINIMUM_JITO_TIP_LAMPORTS},
-    pool_cache::{resolve_pool_keys, RaydiumPoolKeys, WSOL_MINT},
+    pool_cache::{RaydiumPoolKeys, WSOL_MINT},
     state::BotState,
     types::SwapEvent,
 };
@@ -5247,6 +5268,8 @@ pub struct ActivePosition {
     pub mint: String,
     /// Source pool ID used for execution — used to filter price ticks.
     pub source_pool_id: String,
+    /// Pool keys used for the exit, pre-resolved during the buy phase.
+    pub pool_keys: RaydiumPoolKeys,
     /// Entry price: WSOL lamports received per token raw unit at buy time.
     /// Computed as `wsol_out_lamports / token_in_raw`.
     /// Stored as (numerator, denominator) to avoid precision loss.
@@ -5261,6 +5284,10 @@ pub struct ActivePosition {
     pub block_engine_url: String,
     /// The timestamp in milliseconds when the position was acquired.
     pub entry_timestamp_ms: u64,
+    /// Jito don't front pubkey for MEV protection on the sell side.
+    pub jito_dont_front_pubkey: solana_sdk::pubkey::Pubkey,
+    /// Max slippage basis points for the exit swap.
+    pub max_slippage_bps: u16,
 }
 
 // ============================================================================
@@ -5424,18 +5451,7 @@ async fn run_watcher(
         position.mint, position.acquired_amount
     );
 
-    // Resolve the Raydium pool keys once. We need them to build the sell
-    // instruction. If resolution fails, we cannot execute any sell.
-    let pool_keys = match resolve_pool_keys(rpc_client.as_ref(), &position.mint).await {
-        Ok(keys) => keys,
-        Err(err) => {
-            eprintln!(
-                "[exits] 🚨 Pool resolution failed for {}: {}. Aborting watcher.",
-                position.mint, err
-            );
-            return;
-        }
-    };
+    let pool_keys = position.pool_keys.clone();
 
     println!(
         "[exits] ✅ Pool keys resolved for {} (amm_id={}).",
@@ -5636,10 +5652,52 @@ async fn run_watcher(
                 telegram_bot_token.clone(),
                 telegram_chat_id.clone(),
                 true, // is_final_exit
+                cur_wsol_num,
+                cur_wsol_den,
             )
             .await;
             return;
         }
+        // ====================================================================
+        // EXIT CONDITION VWAP — Mean-Reversion Snapback (Breakeven/Profit)
+        // ====================================================================
+        // current_price >= entry_price
+        let is_snapback = cur_wsol_num
+            .checked_mul(position.entry_price_wsol_den)
+            .and_then(|lhs| {
+                position
+                    .entry_price_wsol_num
+                    .checked_mul(cur_wsol_den)
+                    .map(|rhs| lhs >= rhs)
+            })
+            .unwrap_or(false);
+
+        if is_snapback {
+            println!(
+                "[exits] 🎯 VWAP SNAPBACK: Price fully recovered to entry for {}. \
+                 Executing full sell to lock in breakeven/profit.",
+                position.mint
+            );
+            execute_sell_with_retry(
+                "VWAP_SNAPBACK",
+                &position,
+                &pool_keys,
+                mint_pubkey,
+                rpc_client.clone(),
+                payer.clone(),
+                bot_state.clone(),
+                dry_run,
+                &http_client,
+                telegram_bot_token.clone(),
+                telegram_chat_id.clone(),
+                true, // is_final_exit
+                cur_wsol_num,
+                cur_wsol_den,
+            )
+            .await;
+            return;
+        }
+
         // ====================================================================
         // EXIT CONDITION A — Adaptive Partial Exit (50% Scale-Out)
         // ====================================================================
@@ -5661,7 +5719,7 @@ async fn run_watcher(
             let mut partial_position = position.clone();
             partial_position.acquired_amount = partial_amount;
 
-            execute_sell_with_retry(
+            let success = execute_sell_with_retry(
                 "ADAPTIVE_SCALE_OUT_50PCT",
                 &partial_position,
                 &pool_keys,
@@ -5674,12 +5732,16 @@ async fn run_watcher(
                 telegram_bot_token.clone(),
                 telegram_chat_id.clone(),
                 false, // is_final_exit
+                cur_wsol_num,
+                cur_wsol_den,
             )
             .await;
 
-            // Reduce our local tracked bag by the amount sold so the trailing stop sells the rest
-            position.acquired_amount -= partial_amount;
-            partial_sold = true;
+            if success {
+                // Reduce our local tracked bag ONLY IF the sell actually landed on chain
+                position.acquired_amount -= partial_amount;
+                partial_sold = true;
+            }
             continue;
         }
 
@@ -5766,6 +5828,8 @@ async fn run_watcher(
                     telegram_bot_token.clone(),
                     telegram_chat_id.clone(),
                     true, // is_final_exit
+                    cur_wsol_num,
+                    cur_wsol_den,
                 )
                 .await;
                 return;
@@ -5805,7 +5869,9 @@ async fn execute_sell_with_retry(
     telegram_bot_token: Option<String>,
     telegram_chat_id: Option<String>,
     is_final_exit: bool,
-) {
+    cur_wsol_num: u128,
+    cur_wsol_den: u128,
+) -> bool {
     if dry_run {
         println!(
             "[exits] 💸 [DRY RUN] Sell triggered ({}) for {}. No bundle dispatched.",
@@ -5819,30 +5885,57 @@ async fn execute_sell_with_retry(
                 released, position.mint
             );
         }
-        return;
+        return true;
     }
 
-    let result = attempt_sell_bundle(position, pool_keys, mint_pubkey, rpc_client, payer).await;
+    let expected_wsol = (position.acquired_amount as u128)
+        .checked_mul(cur_wsol_num)
+        .unwrap_or(0) / cur_wsol_den.max(1);
+    let minimum_amount_out = crate::execution::calculate_local_minimum_amount_out(
+        expected_wsol as u64,
+        position.max_slippage_bps,
+    ).unwrap_or(1);
+
+    let result = attempt_sell_bundle(
+        position, pool_keys, mint_pubkey, rpc_client.clone(), payer, minimum_amount_out
+    ).await;
 
     match result {
-        Ok(bundle_id) => {
+        Ok((bundle_id, signature)) => {
             println!(
                 "[exits] ✅ Sell bundle ACCEPTED ({}) for {} | bundle_id={}.",
                 reason, position.mint, bundle_id
             );
+            println!("[exits] ⏳ Waiting for on-chain confirmation of signature: {}", signature);
+
+            let mut confirmed = false;
+            for _ in 0..15 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Ok(response) = rpc_client.get_signature_statuses(&[signature]).await {
+                    if let Some(Some(status)) = response.value.first() {
+                        if status.satisfies_commitment(solana_sdk::commitment_config::CommitmentConfig { commitment: solana_sdk::commitment_config::CommitmentLevel::Confirmed }) {
+                            if status.err.is_none() {
+                                confirmed = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !confirmed {
+                eprintln!("[exits] 🚨 Sell bundle {} was accepted but DID NOT CONFIRM on-chain.", bundle_id);
+                return false;
+            }
+
+            println!("[exits] ✅ Sell transaction CONFIRMED on-chain!");
 
             // ---- Phase 6: Close Position in Database -----------------------
             //
             // Record the exit in the SQLite positions table so the operator
             // has a complete PnL record across the full trade lifecycle.
             if is_final_exit {
-                if let Err(e) = db::close_position(&position.mint) {
-                    log::error!(
-                        "[Phase 6] ⚠️ Failed to close position in database for {}: {}",
-                        position.mint,
-                        e,
-                    );
-                }
+                db::close_position(&position.mint);
 
                 // Release the shadow position lock now that we have bundle acceptance.
                 // Note: bundle acceptance ≠ on-chain confirmation, but Jito blocks
@@ -5904,8 +5997,10 @@ async fn execute_sell_with_retry(
             );
             // Do NOT release the shadow position — leave it as a sentinel so
             // the operator knows this mint is in an unresolved state.
+            return false;
         }
     }
+    true
 }
 
 /// Executes the full sell pipeline: build instruction → sign bundle → submit.
@@ -5916,7 +6011,8 @@ async fn attempt_sell_bundle(
     mint_pubkey: Pubkey,
     rpc_client: Arc<RpcClient>,
     payer: Arc<Keypair>,
-) -> Result<String, ExitError> {
+    minimum_amount_out: u64,
+) -> Result<(String, solana_sdk::signature::Signature), ExitError> {
     // Derive ATAs for the sell: source = token ATA, destination = WSOL ATA.
     let user_owner = payer.pubkey();
     let user_source_token_account =
@@ -5982,16 +6078,13 @@ async fn attempt_sell_bundle(
         };
 
         // Build the sell instruction: Token → WSOL.
-        // minimum_amount_out = 1 (accept any output; slippage risk is
-        // accepted in panic/stop scenarios — correctness > price).
-        // In mean-reversion exits the price has recovered so slippage is low.
-        let swap_ix = match construct_raydium_swap_instruction(
+        let mut swap_ix = match construct_raydium_swap_instruction(
             pool_keys,
             user_owner,
             user_source_token_account,
             user_destination_wsol_account,
             position.acquired_amount,
-            1, // minimum_amount_out — see note above
+            minimum_amount_out,
         ) {
             Ok(ix) => ix,
             Err(err) => {
@@ -6000,6 +6093,10 @@ async fn attempt_sell_bundle(
                 )));
             }
         };
+
+        if let Err(e) = crate::execution::apply_jitodontfront_protection(&mut swap_ix, position.jito_dont_front_pubkey) {
+            eprintln!("[exits] ⚠️ Failed to apply MEV protection: {}", e);
+        }
 
         // Select the next tip account (round-robin).
         let tip_account = jito.tip_accounts[jito.next_tip_index];
@@ -6061,7 +6158,8 @@ async fn attempt_sell_bundle(
                     eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
                     continue;
                 }
-                return Ok(bundle_id);
+                let sig = transaction.signatures[0];
+                return Ok((bundle_id, sig));
             }
             Ok(Err(status)) => {
                 last_error = format!("gRPC status: {status}");
@@ -6602,9 +6700,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // The Rust Engine acts as the master process and automatically spawns the
     // Python WhaleSignalLab daemon in the background to ensure continuous 
     // telemetry and watchlist updates.
+    let daemon_path = std::env::var("BRAIN_DAEMON_PATH")
+        .unwrap_or_else(|_| "D:\\FruxLabs\\WhaleSignalLab\\brain_daemon.py".to_string());
+    let daemon_cwd = std::env::var("BRAIN_DAEMON_CWD")
+        .unwrap_or_else(|_| "/mnt/d/FruxLabs/WhaleSignalLab".to_string());
+
     match std::process::Command::new("python.exe")
-        .arg("D:\\FruxLabs\\WhaleSignalLab\\brain_daemon.py")
-        .current_dir("/mnt/d/FruxLabs/WhaleSignalLab")
+        .arg(&daemon_path)
+        .current_dir(&daemon_cwd)
         .spawn()
     {
         Ok(_) => log::info!("🧠 Python Brain Daemon spawned successfully in the background!"),
@@ -6750,7 +6853,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tasks_spawned.fetch_add(1, Ordering::Relaxed);
     let webhook_state = webhook::WebhookState {
         signal_tx,
-        api_key: std::env::var("WEBHOOK_API_KEY").unwrap_or_else(|_| "supersecret".to_string()),
+        api_key: std::env::var("WEBHOOK_API_KEY").unwrap_or_else(|_| {
+            log::error!("CRITICAL: WEBHOOK_API_KEY is missing from environment! Refusing to start with default key.");
+            std::process::exit(1);
+        }),
         watchlist: config.watchlist.clone(),
     };
     workers.spawn(async move {
@@ -6817,7 +6923,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 
                 tip_clone,
                 dispatcher,
-                false, // dry_run
+                !live_execution, // dry_run
                 Some(bundle_tracker.clone()),
                 http_client,
                 tg_bot_token,
@@ -6869,7 +6975,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             
             
             
-            let cb = health_state.is_circuit_breaker_active();
+            let cb = health_state.is_circuit_breaker_active().await;
             let open_pos = health_state.open_position_count();
             let notifications_received = websocket::NOTIFICATIONS_RECEIVED.load(Ordering::Relaxed);
             let swaps_decoded = websocket::SWAPS_DECODED.load(Ordering::Relaxed);
@@ -8374,9 +8480,9 @@ FILE: c:/FruxLabs/Alpha-Whales/src\state.rs
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, Mutex as TokioMutex};
 
 // ============================================================================
 // MAX_CONCURRENT_POSITIONS — Open Position Concurrency Cap
@@ -8448,10 +8554,7 @@ pub struct BotState {
 
     /// Timestamp of the moment the circuit breaker first tripped.
     /// `None` when the breaker is not active or has been auto-reset.
-    /// Uses std::sync::Mutex (not tokio) because reads are fast and
-    /// is_circuit_breaker_active must remain a synchronous fn for use
-    /// in the hot websocket loop without .await overhead.
-    circuit_breaker_tripped_at: Mutex<Option<Instant>>,
+    circuit_breaker_tripped_at: TokioMutex<Option<Instant>>,
 }
 
 #[expect(
@@ -8465,7 +8568,7 @@ impl BotState {
             consecutive_losses: AtomicUsize::new(0),
             position_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_POSITIONS)),
             shadow_positions: RwLock::new(HashMap::new()),
-            circuit_breaker_tripped_at: Mutex::new(None),
+            circuit_breaker_tripped_at: TokioMutex::new(None),
         })
     }
 
@@ -8590,27 +8693,19 @@ impl BotState {
     /// - **Cooldown expired** (elapsed >= 30 min): Resets `consecutive_losses`
     ///   to 0, clears the timestamp, returns `false`. Trading resumes.
     ///   Logs a confirmation so operators know the bot self-recovered.
-    pub fn is_circuit_breaker_active(&self) -> bool {
+    pub async fn is_circuit_breaker_active(&self) -> bool {
         let losses = self.consecutive_losses.load(Ordering::SeqCst);
 
         if losses < CIRCUIT_BREAKER_THRESHOLD {
-            // Below threshold — clear the trip timer from any previous cycle.
-            let mut guard = self
-                .circuit_breaker_tripped_at
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = self.circuit_breaker_tripped_at.lock().await;
             *guard = None;
             return false;
         }
 
-        let mut guard = self
-            .circuit_breaker_tripped_at
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.circuit_breaker_tripped_at.lock().await;
 
         match *guard {
             None => {
-                // Circuit breaker tripping for the first time — record timestamp.
                 *guard = Some(Instant::now());
                 eprintln!(
                     "🔴 CIRCUIT BREAKER TRIPPED: {} consecutive stop-losses. \
@@ -9032,7 +9127,7 @@ impl Default for TipConfig {
             tip_floor_url: "https://bundles.jito.wtf/api/v1/bundles/tip_floor".to_string(),
             refresh_interval: Duration::from_secs(30),
             max_telemetry_age: Duration::from_secs(120),
-            max_profit_share_bps: 2500,
+            max_profit_share_bps: 5000,
             minimum_net_profit_lamports: 0,
         }
     }
@@ -9085,7 +9180,13 @@ impl TipTelemetryEngine {
                         telemetry.p75_lamports,
                         telemetry.p95_lamports,
                     );
-                    *self.inner.telemetry.write().unwrap() = Some(telemetry);
+                    match self.inner.telemetry.write() {
+                        Ok(mut lock) => *lock = Some(telemetry),
+                        Err(poison) => {
+                            log::warn!("Recovering poisoned tip telemetry write lock");
+                            *poison.into_inner() = Some(telemetry);
+                        }
+                    }
                 }
                 Err(error) => {
                     log::warn!("Tip telemetry refresh failed: {error}; keeping previous snapshot");
@@ -9122,7 +9223,15 @@ impl TipTelemetryEngine {
         pre_tip_expected_profit_lamports: u64,
         now: Instant,
     ) -> TipDecision {
-        let telemetry = match *self.inner.telemetry.read().unwrap() {
+        let telemetry_guard = match self.inner.telemetry.read() {
+            Ok(guard) => guard,
+            Err(poison) => {
+                log::warn!("Recovering poisoned tip telemetry read lock");
+                poison.into_inner()
+            }
+        };
+        
+        let telemetry = match *telemetry_guard {
             Some(t) => t,
             None => {
                 return TipDecision::Skip {
@@ -9556,6 +9665,7 @@ pub struct WhaleSignal {
     pub whale_wallet: String,
     pub trade_size_sol: f64,
     pub timestamp_ms: u64,
+    pub lane: crate::config::WhaleLane,
 }
 
 
@@ -9678,13 +9788,13 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::Sender;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 
 #[derive(Clone)]
 pub struct WebhookState {
     pub signal_tx: Sender<WhaleSignal>,
     pub api_key: String,
-    pub watchlist: Arc<RwLock<std::collections::HashMap<String, crate::config::WhaleProfile>>>,
+    pub watchlist: Arc<DashMap<String, crate::config::WhaleProfile>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -9693,6 +9803,7 @@ pub struct HeliusWebhookPayload {
     pub event_type: String,
     #[serde(rename = "feePayer")]
     pub fee_payer: String,
+    pub timestamp: u64,
     pub events: Option<HeliusEvents>,
 }
 
@@ -9785,9 +9896,10 @@ async fn handle_webhook(
             
             // Look up the whale in our dynamic sizing watchlist
             let mut trade_size_lamports = 10_000_000.0; // Default 0.01 SOL fallback
+            let mut signal_lane = crate::config::WhaleLane::Unknown;
             
-            let watchlist_read = state.watchlist.read().await;
-            if let Some(profile) = watchlist_read.get(whale_wallet) {
+            if let Some(profile) = state.watchlist.get(whale_wallet) {
+                signal_lane = profile.lane;
                 trade_size_lamports = match profile.lane {
                     crate::config::WhaleLane::Conservative => 30_000_000.0, // 0.03 SOL
                     crate::config::WhaleLane::Swing => 20_000_000.0,       // 0.02 SOL
@@ -9799,18 +9911,15 @@ async fn handle_webhook(
             } else {
                 log::warn!("Wallet {} not found in watchlist. Using fallback size.", whale_wallet);
             }
-            drop(watchlist_read);
 
-            let timestamp_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let timestamp_ms = trade.timestamp * 1000;
 
             let signal = WhaleSignal {
                 target_mint: token_mint.clone(),
                 whale_wallet: whale_wallet.clone(),
                 trade_size_sol: trade_size_lamports / 1_000_000_000.0,
                 timestamp_ms,
+                lane: signal_lane,
             };
 
             if let Err(e) = state.signal_tx.try_send(signal) {
@@ -11395,35 +11504,22 @@ import os
 import time
 import schedule
 import requests
+import subprocess
+import threading
+import pandas as pd
 from dotenv import load_dotenv
 
-from block_sniffer import run_block_sniffer
-from wallet_scorer import main as run_wallet_scorer
+import db_manager
+from feedback_loop import run_feedback_loop
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def send_telegram_alert(sniffer_stats, scorer_stats):
+def send_telegram_alert(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID. Skipping alert.")
         return
-
-    message = f"""
-🚨 *WhaleSignalLab Auto-Scan Complete* 🚨
-
-🕵️ *Block Sniffer:*
-- Tokens Scanned: `{sniffer_stats.get('tokens_scanned', 0)}`
-- Sniper Candidates Found: `{sniffer_stats.get('snipers_found', 0)}`
-
-⚖️ *Wallet Scorer:*
-- Wallets Analyzed: `{scorer_stats.get('wallets_analyzed', 0)}`
-- Verified & Approved: `{scorer_stats.get('wallets_approved', 0)}`
-- Failed Parameters: `{scorer_stats.get('wallets_rejected', 0)}`
-
-🔄 Rust Engine Hot-Reload Triggered!
-"""
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -11431,56 +11527,263 @@ def send_telegram_alert(sniffer_stats, scorer_stats):
         "text": message,
         "parse_mode": "Markdown"
     }
-
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            print("✅ Telegram alert sent successfully!")
-        else:
-            print(f"❌ Failed to send Telegram alert: {response.text}")
+        requests.post(url, json=payload, timeout=10)
+    except:
+        pass
+
+def ingest_csv_to_db(csv_path, source, is_sniper=False):
+    if not os.path.exists(csv_path):
+        return 0
+    try:
+        df = pd.read_csv(csv_path)
+        added = db_manager.add_discovered_whales(df, source, is_sniper)
+        os.remove(csv_path) # Clean up so we don't double-ingest
+        return added
     except Exception as e:
-        print(f"❌ Exception while sending Telegram alert: {e}")
+        print(f"Error ingesting {csv_path}: {e}")
+        return 0
 
-
-def pipeline_job():
+def producer_job():
     print("\n" + "="*50)
-    print("🚀 STARTING BRAIN PIPELINE RUN...")
+    print("🚀 PRODUCER THREAD: Starting Discovery Cycle...")
     print("="*50)
     
-    print("\n[1/2] Running Block Sniffer...")
+    total_new = 0
+    
+    print("\n[1/3] Running Telegram Scraper Pipeline...")
     try:
-        sniffer_stats = run_block_sniffer()
+        subprocess.run(["python", "scraper.py"], check=True)
+        subprocess.run(["python", "helius_matcher.py"], check=True)
+        added = ingest_csv_to_db("resolved_whale_wallets.csv", "Telegram", is_sniper=False)
+        total_new += added
+        print(f"Telegram pipeline found {added} new unique wallets.")
+    except Exception as e:
+        print(f"Error in Telegram Pipeline: {e}")
+        
+    print("\n[2/3] Running Leaderboard Scraper...")
+    try:
+        subprocess.run(["python", "leaderboard_scraper.py"], check=True)
+        added = ingest_csv_to_db("candidate_whales.csv", "GMGN Leaderboard", is_sniper=False)
+        total_new += added
+        print(f"GMGN pipeline found {added} new unique wallets.")
+    except Exception as e:
+        print(f"Error in Leaderboard Scraper: {e}")
+        
+    print("\n[3/3] Running Block Sniffer...")
+    try:
+        subprocess.run(["python", "block_sniffer.py"], check=True)
+        added = ingest_csv_to_db("sniper_candidates.csv", "Block Sniffer", is_sniper=True)
+        total_new += added
+        print(f"Sniffer pipeline found {added} new unique snipers.")
     except Exception as e:
         print(f"Error in Block Sniffer: {e}")
-        sniffer_stats = {"tokens_scanned": 0, "snipers_found": 0}
         
-    print("\n[2/2] Running Wallet Scorer...")
-    try:
-        scorer_stats = run_wallet_scorer()
-    except Exception as e:
-        print(f"Error in Wallet Scorer: {e}")
-        scorer_stats = {"wallets_analyzed": 0, "wallets_approved": 0, "wallets_rejected": 0}
+    if total_new > 0:
+        send_telegram_alert(f"🚀 *Discovery Complete*\nAdded `{total_new}` new unique whales to `candidates.db` for scoring.")
         
-    print("\n[3/3] Sending Telegram Alert...")
-    send_telegram_alert(sniffer_stats, scorer_stats)
-    
     print("\n" + "="*50)
-    print("💤 PIPELINE RUN COMPLETE. SLEEPING UNTIL NEXT CYCLE...")
+    print("💤 PRODUCER CYCLE COMPLETE. SLEEPING FOR 15 MINS...")
     print("="*50 + "\n")
 
-if __name__ == "__main__":
-    print("🧠 WhaleSignalLab Brain Daemon Started!")
-    print("⏰ Schedule: Running every 15 minutes...")
+
+def producer_worker():
+    # Run once immediately
+    producer_job()
     
-    # Run once immediately on startup
-    pipeline_job()
+    schedule.every(15).minutes.do(producer_job)
     
-    # Then schedule every 15 minutes
-    schedule.every(15).minutes.do(pipeline_job)
+    # Run feedback loop every hour
+    schedule.every(1).hours.do(run_feedback_loop)
     
     while True:
         schedule.run_pending()
         time.sleep(1)
+
+
+def consumer_worker():
+    print("⚖️ CONSUMER THREAD: Started continuous scoring loop.")
+    while True:
+        try:
+            # The wallet_scorer.py script grabs a batch of 25 from the DB and scores them.
+            subprocess.run(["python", "wallet_scorer.py"])
+        except Exception as e:
+            print(f"Consumer Error: {e}")
+            
+        # Rest briefly before polling the DB again
+        time.sleep(10)
+
+if __name__ == "__main__":
+    print("🧠 WhaleSignalLab Level 3 Daemon Started!")
+    
+    # Initialize the time-series SQLite database
+    db_manager.init_db()
+    
+    print("Spawning Producer and Consumer threads...")
+    
+    t_producer = threading.Thread(target=producer_worker, daemon=True)
+    t_consumer = threading.Thread(target=consumer_worker, daemon=True)
+    
+    t_producer.start()
+    t_consumer.start()
+    
+    try:
+        # Keep main thread alive
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nDaemon shutting down...")
+
+
+================================================================================
+FILE: d:/FruxLabs/WhaleSignalLab\db_manager.py
+================================================================================
+
+import sqlite3
+import pandas as pd
+import os
+
+DB_PATH = "candidates.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Table to store raw discovered wallets
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS discovered_whales (
+        wallet_address TEXT PRIMARY KEY,
+        discovery_source TEXT,
+        discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_sniper BOOLEAN DEFAULT 0
+    )
+    ''')
+    
+    # Table to store all historical scores
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS historical_scores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        wallet_address TEXT,
+        win_rate REAL,
+        net_profit REAL,
+        avg_hold_hours REAL,
+        lane TEXT,
+        scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(wallet_address) REFERENCES discovered_whales(wallet_address)
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    print(f"[+] Initialized {DB_PATH}")
+
+def add_discovered_whales(wallets_df, source, is_sniper=False):
+    if wallets_df.empty: return 0
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    added_count = 0
+    for _, row in wallets_df.iterrows():
+        wallet = row.get('wallet_address') or row.get('whale_wallet')
+        if not wallet: continue
+        
+        try:
+            cursor.execute('''
+            INSERT INTO discovered_whales (wallet_address, discovery_source, is_sniper)
+            VALUES (?, ?, ?)
+            ''', (wallet, source, is_sniper))
+            added_count += 1
+        except sqlite3.IntegrityError:
+            # Wallet already exists, skip
+            pass
+            
+    conn.commit()
+    conn.close()
+    return added_count
+
+def get_wallets_to_score(limit=50):
+    # Get wallets that have NEVER been scored, OR haven't been scored in 24 hours.
+    # Prioritize unscored wallets first.
+    conn = sqlite3.connect(DB_PATH)
+    
+    query = """
+    SELECT dw.wallet_address, dw.is_sniper, MAX(hs.scored_at) as last_scored
+    FROM discovered_whales dw
+    LEFT JOIN historical_scores hs ON dw.wallet_address = hs.wallet_address
+    GROUP BY dw.wallet_address
+    HAVING last_scored IS NULL OR last_scored < datetime('now', '-24 hours')
+    ORDER BY last_scored ASC NULLS FIRST
+    LIMIT ?
+    """
+    
+    df = pd.read_sql_query(query, conn, params=(limit,))
+    conn.close()
+    return df
+
+def insert_score(wallet, win_rate, net_profit, avg_hold_hours, lane):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+    INSERT INTO historical_scores (wallet_address, win_rate, net_profit, avg_hold_hours, lane)
+    VALUES (?, ?, ?, ?, ?)
+    ''', (wallet, win_rate, net_profit, avg_hold_hours, lane))
+    conn.commit()
+    conn.close()
+
+def generate_approved_watchlist(out_path="c:/FruxLabs/Alpha-Whales/approved_watchlist.csv"):
+    if not os.path.exists(DB_PATH):
+        return 0
+        
+    conn = sqlite3.connect(DB_PATH)
+    
+    # Get the MOST RECENT score for each wallet
+    query = """
+    SELECT wallet_address as whale_wallet, win_rate, net_profit, lane,
+           ROW_NUMBER() OVER(PARTITION BY wallet_address ORDER BY scored_at DESC) as rn
+    FROM historical_scores
+    """
+    try:
+        df = pd.read_sql_query(query, conn)
+    except:
+        conn.close()
+        return 0
+    conn.close()
+    
+    if df.empty: return []
+    
+    # Keep only the latest row for each wallet
+    latest_df = df[df['rn'] == 1].copy()
+    
+    approved = []
+    
+    for _, row in latest_df.iterrows():
+        wallet = row['whale_wallet']
+        lane = row['lane']
+        wr = row['win_rate']
+        profit = row['net_profit']
+        
+        if lane == 'Rejected':
+            continue
+            
+        if lane == 'Sniper':
+            if wr >= 0.40 and profit >= 10.0:
+                approved.append(row)
+        else:
+            if wr >= 0.40 and profit >= 25.0:
+                approved.append(row)
+                
+    if not approved:
+        return []
+        
+    final_df = pd.DataFrame(approved)
+    final_df['total_trades'] = 100 
+    final_df['profit_factor'] = 1.0 
+    
+    final_df = final_df[['whale_wallet', 'total_trades', 'win_rate', 'profit_factor', 'net_profit', 'lane']]
+    final_df = final_df.sort_values(by='net_profit', ascending=False)
+    
+    final_df.to_csv(out_path, index=False)
+    return final_df['whale_wallet'].tolist()
 
 
 ================================================================================
@@ -11525,6 +11828,99 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
+
+
+================================================================================
+FILE: d:/FruxLabs/WhaleSignalLab\feedback_loop.py
+================================================================================
+
+import sqlite3
+import pandas as pd
+import os
+
+DB_PATH = "c:/FruxLabs/Alpha-Whales/trade_telemetry.db"
+WATCHLIST_PATH = "c:/FruxLabs/Alpha-Whales/approved_watchlist.csv"
+
+def run_feedback_loop():
+    print("\nStarting Self-Healing Feedback Loop...")
+    
+    if not os.path.exists(DB_PATH):
+        print(f"  [-] Database not found at {DB_PATH}. Skipping feedback loop.")
+        return {"wallets_pruned": 0}
+        
+    if not os.path.exists(WATCHLIST_PATH):
+        print(f"  [-] Watchlist not found at {WATCHLIST_PATH}. Skipping feedback loop.")
+        return {"wallets_pruned": 0}
+
+    # Connect to the Rust execution engine's SQLite DB
+    conn = sqlite3.connect(DB_PATH)
+    
+    # We want to check the last 3 trades for each wallet. 
+    # If all 3 are 'STOP_LOSS', they are toxic in the current market and must be pruned.
+    query = """
+    SELECT wallet_address, execution_status 
+    FROM (
+      SELECT wallet_address, execution_status,
+             ROW_NUMBER() OVER(PARTITION BY wallet_address ORDER BY timestamp DESC) as rn
+      FROM trade_logs
+      WHERE trade_direction = 'SELL'
+    ) 
+    WHERE rn <= 3;
+    """
+    
+    try:
+        df_logs = pd.read_sql_query(query, conn)
+    except Exception as e:
+        print(f"  [-] Error querying trade_telemetry.db: {e}")
+        conn.close()
+        return {"wallets_pruned": 0}
+        
+    conn.close()
+
+    if df_logs.empty:
+        print("  [+] No trade logs found to evaluate.")
+        return {"wallets_pruned": 0}
+
+    toxic_wallets = set()
+    
+    # Group by wallet and evaluate
+    grouped = df_logs.groupby('wallet_address')
+    for wallet, group in grouped:
+        # Check if they have exactly 3 trades and all 3 are 'STOP_LOSS'
+        if len(group) == 3 and (group['execution_status'] == 'STOP_LOSS').all():
+            toxic_wallets.add(wallet)
+            
+    if not toxic_wallets:
+        print("  [+] All monitored whales are performing within risk parameters. No pruning needed.")
+        return {"wallets_pruned": 0}
+        
+    print(f"  [!] Identified {len(toxic_wallets)} TOXIC whales with 3 consecutive stop-losses!")
+    
+    # Load watchlist
+    watchlist_df = pd.read_csv(WATCHLIST_PATH)
+    original_count = len(watchlist_df)
+    
+    # Prune toxic wallets
+    if 'whale_wallet' in watchlist_df.columns:
+        watchlist_df = watchlist_df[~watchlist_df['whale_wallet'].isin(toxic_wallets)]
+        pruned_count = original_count - len(watchlist_df)
+        
+        if pruned_count > 0:
+            watchlist_df.to_csv(WATCHLIST_PATH, index=False)
+            for w in toxic_wallets:
+                 print(f"  -> PRUNED: {w}")
+            print(f"  [+] Saved cleansed watchlist. (Pruned {pruned_count} wallets).")
+            print("  [+] Rust engine DashMap will hot-reload this within 60s.")
+        else:
+            print("  [+] Toxic wallets were already removed from the watchlist.")
+            
+        return {"wallets_pruned": pruned_count}
+    else:
+        print("  [-] 'whale_wallet' column not found in watchlist.")
+        return {"wallets_pruned": 0}
+
+if __name__ == "__main__":
+    run_feedback_loop()
 
 
 ================================================================================
@@ -11632,6 +12028,84 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+================================================================================
+FILE: d:/FruxLabs/WhaleSignalLab\helius_manager.py
+================================================================================
+
+import os
+import requests
+from dotenv import load_dotenv
+
+def sync_webhook(wallets):
+    load_dotenv()
+    api_key = os.getenv("HELIUS_API_KEY")
+    webhook_url = os.getenv("WEBHOOK_URL") 
+    
+    if not api_key or not webhook_url:
+        print("  [!] Helius Auto-Updater: Missing API key or Webhook URL in .env.")
+        return
+        
+    if not wallets:
+        print("  [!] Helius Auto-Updater: No wallets to monitor.")
+        return
+        
+    base_url = f"https://api.helius.xyz/v0/webhooks"
+    
+    # 1. GET all webhooks
+    try:
+        response = requests.get(f"{base_url}?api-key={api_key}", timeout=10)
+        response.raise_for_status()
+        all_webhooks = response.json()
+    except Exception as e:
+        print(f"  [-] Helius Auto-Updater: Failed to fetch webhooks: {e}")
+        return
+        
+    # Find webhooks that match our current URL
+    matching_webhooks = [wh for wh in all_webhooks if wh.get('webhookURL') == webhook_url]
+    
+    master_webhook_id = None
+    
+    if len(matching_webhooks) > 0:
+        master_webhook_id = matching_webhooks[0]['webhookID']
+        
+        # 2. DELETE duplicates
+        if len(matching_webhooks) > 1:
+            print(f"  [+] Helius Auto-Updater: Found {len(matching_webhooks)-1} duplicate webhooks. Deleting them...")
+            for wh in matching_webhooks[1:]:
+                duplicate_id = wh['webhookID']
+                try:
+                    requests.delete(f"{base_url}/{duplicate_id}?api-key={api_key}", timeout=10)
+                    print(f"      -> Deleted duplicate: {duplicate_id}")
+                except Exception as e:
+                    print(f"      -> Failed to delete {duplicate_id}: {e}")
+
+    payload = {
+        "webhookURL": webhook_url,
+        "transactionTypes": ["SWAP"],
+        "accountAddresses": wallets,
+        "webhookType": "enhanced"
+    }
+
+    # 3. PUT or POST
+    if master_webhook_id:
+        try:
+            put_url = f"{base_url}/{master_webhook_id}?api-key={api_key}"
+            res = requests.put(put_url, json=payload, timeout=10)
+            res.raise_for_status()
+            print(f"  [+] Helius Auto-Updater: Synced {len(wallets)} wallets to Webhook ({master_webhook_id[:8]}...).")
+        except Exception as e:
+            print(f"  [-] Helius Auto-Updater: Failed to update webhook: {e}")
+    else:
+        try:
+            post_url = f"{base_url}?api-key={api_key}"
+            res = requests.post(post_url, json=payload, timeout=10)
+            res.raise_for_status()
+            new_id = res.json().get('webhookID')
+            print(f"  [+] Helius Auto-Updater: Created new Webhook ({new_id[:8]}...) with {len(wallets)} wallets.")
+        except Exception as e:
+            print(f"  [-] Helius Auto-Updater: Failed to create webhook: {e}")
 
 
 ================================================================================
@@ -11858,7 +12332,7 @@ def run_scraper():
     coins = fetch_trending_coins()
     if not coins:
         print("No trending coins found. Please verify the GMGN API endpoint or your API Key.")
-        return
+        return {"candidates_found": 0}
 
     # Dictionary to track wallet stats across coins
     # wallet_address -> { "coins_traded": set(), "total_profit": 0, "total_invested": 0, "rois": [] }
@@ -11908,8 +12382,10 @@ def run_scraper():
         df = df.sort_values("coins_sniped", ascending=False)
         df.to_csv("candidate_whales.csv", index=False)
         print(f"Successfully exported {len(df)} whale candidates to candidate_whales.csv")
+        return {"candidates_found": len(df)}
     else:
         print("No wallets met the strict edge criteria (>= 1000% ROI on >= 3 coins with >= 5 SOL).")
+        return {"candidates_found": 0}
 
 if __name__ == "__main__":
     run_scraper()
@@ -11938,8 +12414,8 @@ def main():
         print("Please add WEBHOOK_URL to your .env file (e.g. your ngrok url like https://your-ngrok.app/webhook)")
         return
         
-    # For our live trading signals, let's track the highly profitable Swing Traders
-    input_file = "watchlist_swing.csv"
+    # For our live trading signals, let's track the highly profitable whales
+    input_file = "approved_watchlist.csv"
     if not os.path.exists(input_file):
         print(f"Error: {input_file} not found. Run wallet_scorer.py first.")
         return
@@ -11965,11 +12441,11 @@ def main():
     response = requests.post(url, json=payload, timeout=10)
     
     if response.status_code in [200, 201]:
-        print("\n✅ SUCCESS: Webhook registered and active!")
+        print("\n[SUCCESS]: Webhook registered and active!")
         print(f"Webhook ID: {response.json().get('webhookID')}")
         print("Helius is now monitoring these wallets. Start webhook_server.py to receive signals.")
     else:
-        print("\n❌ Error registering webhook:")
+        print("\n[ERROR] registering webhook:")
         print(response.text)
 
 if __name__ == "__main__":
@@ -11992,7 +12468,7 @@ from datetime import timezone
 load_dotenv()
 API_ID = int(os.getenv('TG_API_ID'))
 API_HASH = os.getenv('TG_API_HASH')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+CHAT_ID = int(os.getenv('TELEGRAM_CHAT_ID'))
 
 SOL_MINT_REGEX = r"\b([1-9A-HJ-NP-Za-km-z]{32,44})\b"
 SOL_BUY_REGEX = r"💸\s*([0-9.]+)\s*SOL\s*→"
@@ -12102,8 +12578,8 @@ import os
 import time
 import json
 import subprocess
-import pandas as pd
-from dotenv import load_dotenv
+import db_manager
+import helius_manager
 
 def run_gmgn_stats(wallet):
     """Executes the gmgn-cli to fetch wallet portfolio stats."""
@@ -12121,53 +12597,38 @@ def run_gmgn_stats(wallet):
         return None
 
 def main():
-    print("Initiating Mathematical Scoring Engine (Phase 3)...\n")
+    print("Initiating Continuous Scoring Engine (Level 3)...\n")
     
-    whales_df = pd.DataFrame()
-    snipers_df = pd.DataFrame()
-    
-    if os.path.exists("candidate_whales.csv"):
-        whales_df = pd.read_csv("candidate_whales.csv")
-        print(f"Loaded {len(whales_df)} Whale candidates.")
+    # Check if DB exists
+    if not os.path.exists(db_manager.DB_PATH):
+        print("Waiting for candidates.db to be initialized by scrapers...")
+        return {"wallets_analyzed": 0, "wallets_approved": 0, "wallets_rejected": 0}
         
-    if os.path.exists("sniper_candidates.csv"):
-        snipers_df = pd.read_csv("sniper_candidates.csv")
-        print(f"Loaded {len(snipers_df)} Sniper candidates.")
-
-    if whales_df.empty and snipers_df.empty:
-        print("Error: No candidate CSVs found to score.")
-        return
-
-    # Extract block offsets for snipers to give them massive score boosts
-    sniper_offsets = {}
-    if not snipers_df.empty:
-        # If a sniper hit multiple, take their best (minimum) offset
-        best_offsets = snipers_df.groupby("wallet_address")["block_offset"].min().to_dict()
-        sniper_offsets.update(best_offsets)
-
-    # Combine unique wallets
-    unique_wallets = set()
-    if not whales_df.empty and "wallet_address" in whales_df.columns:
-        unique_wallets.update(whales_df["wallet_address"].tolist())
-    if not snipers_df.empty and "wallet_address" in snipers_df.columns:
-        unique_wallets.update(snipers_df["wallet_address"].tolist())
-
-    print(f"Scoring {len(unique_wallets)} unique wallets across Strategy Lanes...\n")
+    # Get a small batch of wallets that haven't been scored recently
+    batch_size = 25
+    wallets_to_score = db_manager.get_wallets_to_score(limit=batch_size)
     
-    lanes = {
-        "conservative": [],
-        "swing": [],
-        "degen": [],
-        "sniper": []
-    }
+    if wallets_to_score.empty:
+        print("No wallets need scoring at this time. All caught up!")
+        return {"wallets_analyzed": 0, "wallets_approved": 0, "wallets_rejected": 0}
+        
+    print(f"Pulled {len(wallets_to_score)} wallets from candidates.db for scoring...")
     
-    total = len(unique_wallets)
-    for i, wallet in enumerate(unique_wallets):
+    analyzed_count = 0
+    approved_count = 0
+    rejected_count = 0
+    
+    for i, row in wallets_to_score.iterrows():
+        wallet = row['wallet_address']
+        is_sniper = bool(row['is_sniper'])
+        
         stats = run_gmgn_stats(wallet)
         if not stats:
             time.sleep(1)
             continue
             
+        analyzed_count += 1
+        
         realized_profit = float(stats.get("realized_profit", 0))
         total_buy = int(stats.get("buy", 0))
         total_sell = int(stats.get("sell", 0))
@@ -12176,102 +12637,53 @@ def main():
         pnl_stat = stats.get("pnl_stat", {})
         win_rate = float(pnl_stat.get("winrate", 0))
         avg_hold_time_secs = float(pnl_stat.get("avg_holding_period", 0))
-        
-        # Diamond Hand Ratio (approximated here by raw average holding time in hours)
         avg_hold_hours = avg_hold_time_secs / 3600
         
-        # Slippage Survivability is factored into their ability to maintain High Profit despite many trades
-        profit_factor_proxy = realized_profit / max(1, total_buy) # Profit per buy tx
-        
-        block_offset = sniper_offsets.get(wallet, None)
-        is_sniper = block_offset is not None
-
         if avg_hold_hours < 1.0:
             hold_display = f"{avg_hold_time_secs / 60:.1f}m"
         else:
             hold_display = f"{avg_hold_hours:.1f}h"
             
-        print(f"[{i+1}/{total}] {wallet[:8]}... | Net: {realized_profit:.2f} SOL | WR: {win_rate:.0%} | Avg Hold: {hold_display}")
+        print(f"[{i+1}/{len(wallets_to_score)}] {wallet[:8]}... | Net: {realized_profit:.2f} SOL | WR: {win_rate:.0%} | Avg Hold: {hold_display}")
 
-        row = {
-            "whale_wallet": wallet,
-            "total_trades": total_trades,
-            "win_rate": win_rate,
-            "net_profit": realized_profit,
-            "avg_hold_hours": avg_hold_hours,
-            "block_offset": block_offset if block_offset is not None else -1
-        }
+        # Determine Lane
+        lane = "Rejected"
         
-        # 1. Sniper Lane (Priority)
-        # They must have a block 0-2 entry and not be at a massive loss
-        if is_sniper and block_offset <= 2 and realized_profit > -5.0:
-            lanes["sniper"].append(row)
-            continue # Snipers bypass normal lane checks
-            
-        # 2. Conservative
-        if win_rate >= 0.60 and realized_profit >= 10.0 and avg_hold_hours > 24:
-            lanes["conservative"].append(row)
-        
-        # 3. Swing Trader
+        if is_sniper and realized_profit > 10.0 and win_rate >= 0.40:
+            lane = "Sniper"
+        elif win_rate >= 0.60 and realized_profit >= 10.0 and avg_hold_hours > 24:
+            lane = "Conservative"
         elif win_rate >= 0.40 and realized_profit >= 50.0 and avg_hold_hours > 6:
-            lanes["swing"].append(row)
-            
-        # 4. Degen / Home-Run
+            lane = "Swing"
         elif win_rate >= 0.20 and realized_profit >= 100.0:
-            lanes["degen"].append(row)
+            lane = "Degen"
             
+        if lane != "Rejected":
+            approved_count += 1
+        else:
+            rejected_count += 1
+            
+        # Insert time-series score
+        db_manager.insert_score(wallet, win_rate, realized_profit, avg_hold_hours, lane)
         time.sleep(1.5) # Prevent GMGN CLI API bans
         
     print("\n--- RESULTS ---")
-    all_approved = []
+    print(f"Analyzed: {analyzed_count} | Passed: {approved_count} | Rejected: {rejected_count}")
     
-    for lane_name, approved_list in lanes.items():
-        if approved_list:
-            for row in approved_list:
-                row["lane"] = lane_name.capitalize()
-            out_file = f"watchlist_{lane_name}.csv"
-            out_df = pd.DataFrame(approved_list)
-            out_df.to_csv(out_file, index=False)
-            all_approved.extend(approved_list)
-            print(f"SUCCESS: {lane_name.upper()} Lane -> Added {len(approved_list)} wallets to {out_file}")
-        else:
-            print(f"FAILURE: {lane_name.upper()} Lane -> No wallets met the criteria.")
-            
-    if all_approved:
-        master_df = pd.DataFrame(all_approved)
-        master_df = master_df.sort_values(by='net_profit', ascending=False).drop_duplicates(subset=['whale_wallet'])
-        
-        # We output to the Alpha-Whales Rust Execution directory
-        master_out = "c:/FruxLabs/Alpha-Whales/approved_watchlist.csv"
-        try:
-            # Add required schema columns for Rust if missing
-            if 'profit_factor' not in master_df.columns:
-                master_df['profit_factor'] = 1.0 # Placeholder since we use net_profit now
-                
-            master_df = master_df[['whale_wallet', 'total_trades', 'win_rate', 'profit_factor', 'net_profit', 'lane']]
-            master_df.to_csv(master_out, index=False)
-            print(f"\nSUCCESS: Pushed {len(master_df)} unique wallets directly to {master_out}")
-            print("The Rust Engine will automatically reload this new watchlist without restarting!")
-            
-            return {
-                "wallets_analyzed": len(unique_wallets),
-                "wallets_approved": len(master_df),
-                "wallets_rejected": len(unique_wallets) - len(master_df)
-            }
-        except Exception as e:
-            print(f"\nWARNING: Could not push to Alpha-Whales directory: {e}")
-            return {
-                "wallets_analyzed": len(df),
-                "wallets_approved": len(master_df),
-                "wallets_rejected": len(df) - len(master_df)
-            }
-    else:
-        print("\nNo wallets passed the Mathematical Scoring thresholds.")
-        return {
-            "wallets_analyzed": len(df),
-            "wallets_approved": 0,
-            "wallets_rejected": len(df)
-        }
+    # Generate the active watchlist
+    approved_wallets = db_manager.generate_approved_watchlist()
+    total_approved = len(approved_wallets)
+    print(f"\nSUCCESS: Generated active approved_watchlist.csv with {total_approved} elite whales!")
+    print("The Rust Engine will automatically reload this new watchlist without restarting!")
+    
+    # Sync with Helius
+    helius_manager.sync_webhook(approved_wallets)
+    
+    return {
+        "wallets_analyzed": analyzed_count,
+        "wallets_approved": approved_count,
+        "wallets_rejected": rejected_count
+    }
 
 if __name__ == "__main__":
     main()

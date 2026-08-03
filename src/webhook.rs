@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc::Sender;
 use std::sync::Arc;
 use dashmap::DashMap;
+use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
 pub struct WebhookState {
@@ -78,12 +79,12 @@ async fn handle_webhook(
     Json(payload): Json<Vec<HeliusWebhookPayload>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     
-    // 1. Authenticate Request
+    // AUDIT FIX: CRITICAL #1 — Webhook Auth TLS & Timing
     let auth_header = headers.get("authorization")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
         
-    if auth_header != state.api_key {
+    if auth_header.as_bytes().ct_eq(state.api_key.as_bytes()).unwrap_u8() == 0 {
         log::warn!("Unauthorized webhook attempt");
         return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
     }
@@ -117,8 +118,10 @@ async fn handle_webhook(
             
             // Look up the whale in our dynamic sizing watchlist
             let mut trade_size_lamports = 10_000_000.0; // Default 0.01 SOL fallback
+            let mut signal_lane = crate::config::WhaleLane::Unknown;
             
             if let Some(profile) = state.watchlist.get(whale_wallet) {
+                signal_lane = profile.lane;
                 trade_size_lamports = match profile.lane {
                     crate::config::WhaleLane::Conservative => 30_000_000.0, // 0.03 SOL
                     crate::config::WhaleLane::Swing => 20_000_000.0,       // 0.02 SOL
@@ -138,6 +141,7 @@ async fn handle_webhook(
                 whale_wallet: whale_wallet.clone(),
                 trade_size_sol: trade_size_lamports / 1_000_000_000.0,
                 timestamp_ms,
+                lane: signal_lane,
             };
 
             if let Err(e) = state.signal_tx.try_send(signal) {

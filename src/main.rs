@@ -422,7 +422,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 
                 tip_clone,
                 dispatcher,
-                false, // dry_run
+                !live_execution, // dry_run
                 Some(bundle_tracker.clone()),
                 http_client,
                 tg_bot_token,

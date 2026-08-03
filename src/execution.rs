@@ -1472,25 +1472,6 @@ pub async fn run_whale_execution_consumer(
             }
         };
 
-
-
-        // ---- Phase 4 Opportunity Dedupe Gate -----------------------------
-        // Build a deterministic key from the signal and reject if this
-        // exact opportunity — same mint, same pool, same signal epoch —
-        // was already dispatched (MASTER_PLAN.md Section 4.6).
-        let opp_key = crate::dispatcher::OpportunityKey {
-            mint: signal.target_mint.clone(),
-            pool: signal.whale_wallet.clone(),
-            signal_epoch_secs: signal.timestamp_ms / 1000,
-        };
-        if !dispatcher.try_acquire_dedupe(opp_key).await {
-            log::warn!(
-                "Execution signal rejected for {}: duplicate opportunity (already dispatched in this epoch)",
-                signal.target_mint
-            );
-            continue;
-        }
-
         if journal.contains(&target_mint) {
             log::warn!(
                 "Execution signal rejected for {}: mint is durably locked after a prior submission attempt",
@@ -1522,12 +1503,21 @@ pub async fn run_whale_execution_consumer(
             continue;
         }
 
+        let mut signal_config = config.clone();
+        signal_config.max_slippage_bps = match signal.lane {
+            crate::config::WhaleLane::Sniper => 250, // 2.5%
+            crate::config::WhaleLane::Degen => 200,  // 2.0%
+            crate::config::WhaleLane::Swing => 150,  // 1.5%
+            crate::config::WhaleLane::Conservative => 100, // 1.0%
+            _ => config.max_slippage_bps,
+        };
+
         let dynamic_amount_in = (signal.trade_size_sol * 1_000_000_000.0) as u64;
         let prepared = match resolve_swap_instructions_for_signal(
             &signal,
             rpc_client.as_ref(),
             &payer,
-            &config,
+            &signal_config,
         )
         .await
         {
@@ -1608,6 +1598,32 @@ pub async fn run_whale_execution_consumer(
             continue;
         }
 
+        // ---- Phase 4 Opportunity Dedupe Gate -----------------------------
+        // BUGFIX (High, audit 2026-08): previously acquired at the very top
+        // of the loop, before pool resolution / quote validation / tip-gate
+        // / signing could still fail and `continue`. Since none of those
+        // failure paths released the dedupe key, a signal that failed for a
+        // purely transient reason (RPC blip, momentary tip-gate skip) was
+        // locked out of retry for the full OPPORTUNITY_DEDUPE_TTL_SECS
+        // window even though nothing was ever submitted. Acquiring the key
+        // here — immediately before the durable journal reservation, once
+        // the bundle is fully built and signed — means dedupe now only
+        // blocks genuine re-submission of an opportunity we already
+        // committed capital to (MASTER_PLAN.md Section 4.6).
+        let opp_key = crate::dispatcher::OpportunityKey {
+            mint: signal.target_mint.clone(),
+            pool: signal.whale_wallet.clone(),
+            signal_epoch_secs: signal.timestamp_ms / 1000,
+        };
+        if !dispatcher.try_acquire_dedupe(opp_key).await {
+            log::warn!(
+                "Execution signal rejected for {}: duplicate opportunity (already dispatched in this epoch)",
+                signal.target_mint
+            );
+            bot_state.unlock_mint(&signal.target_mint).await;
+            continue;
+        }
+
         // Persist and sync the signature and capital reservation before the
         // first SendBundle attempt. A timeout is therefore never safe to retry,
         // including after a process restart.
@@ -1616,7 +1632,7 @@ pub async fn run_whale_execution_consumer(
                 &signal,
                 prepared_target_mint,
                 destination_ata_rent_lamports,
-                &config,
+                &signal_config,
                 &signed_bundle,
             )
             .await?;
@@ -1734,68 +1750,91 @@ pub async fn run_whale_execution_consumer(
                     signal.target_mint, tx_signature_string
                 );
 
-                let handoff_result = confirm_and_handoff(
-                    &signal,
-                    &tx_signature_string,
-                    prepared_target_mint,
-                    pool_id.clone(),
-                    pool_keys.clone(),
-                    &config,
-                    rpc_client.clone(),
-                    payer.clone(),
-                    bot_state.clone(),
-                    &exit_broadcast_tx,
-                    permit,
-                    dry_run,
-                    bundle_slot,
-                    bundle_region,
-                    http_client.clone(),
-                    telegram_bot_token.clone(),
-                    telegram_chat_id.clone(),
-                )
-                .await;
+                let signal_clone = signal.clone();
+                let tx_signature_clone = tx_signature_string.clone();
+                let config_clone = signal_config.clone();
+                let exit_tx_clone = exit_broadcast_tx.clone();
+                let pool_id_clone = pool_id.clone();
+                let pool_keys_clone = pool_keys.clone();
+                let rpc_clone = rpc_client.clone();
+                let payer_clone = payer.clone();
+                let state_clone = bot_state.clone();
+                let http_clone = http_client.clone();
+                let token_clone = telegram_bot_token.clone();
+                let chat_clone = telegram_chat_id.clone();
+                
+                tokio::spawn(async move {
+                    let handoff_result = confirm_and_handoff(
+                        &signal_clone,
+                        &tx_signature_clone,
+                        prepared_target_mint,
+                        pool_id_clone,
+                        pool_keys_clone,
+                        &config_clone,
+                        rpc_clone,
+                        payer_clone,
+                        state_clone,
+                        &exit_tx_clone,
+                        permit,
+                        dry_run,
+                        bundle_slot,
+                        bundle_region,
+                        http_clone.clone(),
+                        token_clone.clone(),
+                        chat_clone.clone(),
+                    )
+                    .await;
 
-                match handoff_result {
-                    Ok(()) => {
-                        println!(
-                            "[handoff] ✅ Position watcher spawned for {}.",
-                            signal.target_mint
-                        );
-                        if let (Some(bot_token), Some(chat_id)) = (
-                            telegram_bot_token.clone(),
-                            telegram_chat_id.clone(),
-                        ) {
-                            let client_clone = http_client.clone();
-                            let mint_str = signal.target_mint.clone();
-                            let sig_str = tx_signature_string.clone();
-                            let trade_size = format!("Bot Trade: {} SOL", (dynamic_amount_in as f64) / 1_000_000_000.0);
-                            tokio::spawn(async move {
-                                crate::telegram::send_telegram_alert(
-                                    &client_clone,
-                                    &bot_token,
-                                    &chat_id,
-                                    &mint_str,
-                                    1.0, // positive net change means BUY
-                                    "Bot Execution", // generic wallet identifier
-                                    &sig_str,
-                                    "LANDED ON-CHAIN ✅",
-                                    &trade_size,
-                                ).await;
-                            });
+                    match handoff_result {
+                        Ok(()) => {
+                            println!(
+                                "[handoff] ✅ Position watcher spawned for {}.",
+                                signal_clone.target_mint
+                            );
+                            
+                            let size_sol = (dynamic_amount_in as f64) / 1_000_000_000.0;
+                            db::log_trade_telemetry(
+                                &signal_clone.whale_wallet,
+                                &signal_clone.target_mint,
+                                "BUY",
+                                size_sol,
+                                0.0,
+                                "LANDED",
+                            );
+                            
+                            if let (Some(bot_token), Some(chat_id)) = (
+                                token_clone,
+                                chat_clone,
+                            ) {
+                                let client_clone = http_clone;
+                                let mint_str = signal_clone.target_mint.clone();
+                                let sig_str = tx_signature_clone.clone();
+                                let trade_size = format!("Bot Trade: {} SOL", size_sol);
+                                tokio::spawn(async move {
+                                    crate::telegram::send_telegram_alert(
+                                        &client_clone,
+                                        &bot_token,
+                                        &chat_id,
+                                        &mint_str,
+                                        1.0, 
+                                        "Bot Execution", 
+                                        &sig_str,
+                                        "LANDED ON-CHAIN ✅",
+                                        &trade_size,
+                                    ).await;
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "[handoff] 🚨 HANDOFF FAILED for {} (sig={}): {}. \
+                                 Position may be open without an exit watcher. \
+                                 MANUAL REVIEW REQUIRED.",
+                                signal_clone.target_mint, tx_signature_clone, error
+                            );
                         }
                     }
-                    Err(error) => {
-                        log::warn!(
-                            "[handoff] 🚨 HANDOFF FAILED for {} (sig={}): {}. \
-                             Position may be open without an exit watcher. \
-                             MANUAL REVIEW REQUIRED.",
-                            signal.target_mint, tx_signature_string, error
-                        );
-                        // The permit was consumed by confirm_and_handoff (either
-                        // passed to the watcher or dropped on error). The journal
-                        // entry persists, preventing a duplicate buy attempt.
-                    }
-                }
+                });
             }
             Err(error) => {
                 log::warn!(
@@ -1924,6 +1963,7 @@ async fn confirm_and_handoff(
     // precision loss.
     let position = ActivePosition {
         mint: signal.target_mint.clone(),
+        whale_wallet: signal.whale_wallet.clone(),
         source_pool_id: pool_id.clone(),
         pool_keys,
         entry_price_wsol_num: dynamic_amount_in as u128,

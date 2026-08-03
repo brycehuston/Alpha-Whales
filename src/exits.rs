@@ -156,6 +156,11 @@ const PROFIT_LOCK_FLOOR_MULT: f64 = 1.10;
 pub struct ActivePosition {
     /// Base58 mint address of the token being held.
     pub mint: String,
+    /// Whale wallet whose signal triggered this position. Persisted so the
+    /// sell-side telemetry write (`db::log_trade_telemetry`) can be
+    /// attributed back to the same wallet as the buy-side write, which is
+    /// what `feedback_loop.py`'s toxic-wallet pruning query groups by.
+    pub whale_wallet: String,
     /// Source pool ID used for execution — used to filter price ticks.
     pub source_pool_id: String,
     /// Pool keys used for the exit, pre-resolved during the buy phase.
@@ -840,30 +845,50 @@ async fn execute_sell_with_retry(
                 }
             }
 
-            // Update circuit-breaker loss counter.
-            // We measure profit as: did we get the snapback?
-            // Proxy: if reason == "VWAP_SNAPBACK" it is a win; anything else
-            // (panic dump, trailing stop) is treated as a loss.
+            // ---- Circuit-breaker loss-streak accounting --------------------
+            //
+            // BUGFIX (High, audit 2026-08): previously ran unconditionally
+            // (even for non-final partial exits) and classified win/loss by
+            // string-matching the exit `reason` against the literal
+            // "VWAP_SNAPBACK" — so a winning ADAPTIVE_SCALE_OUT_50PCT partial
+            // exit (which only fires on >=100% ROI in under 60s, i.e. a
+            // clean win) was counted as a loss and could trip the 3-strike
+            // breaker during a winning streak. The streak is now gated on
+            // `is_final_exit` (partial scale-outs don't close the position,
+            // so they shouldn't move the streak either way) and classified
+            // by the actual realized PnL sign rather than a reason string.
             use std::sync::atomic::Ordering;
-            if reason == "VWAP_SNAPBACK" {
-                bot_state.consecutive_losses.store(0, Ordering::SeqCst);
-                println!(
-                    "[exits] ✅ POSITION CLOSED [{}] | reason={} | loss streak RESET.",
-                    position.mint, reason
-                );
-            } else {
-                let streak = bot_state.consecutive_losses.fetch_add(1, Ordering::SeqCst) + 1;
-                eprintln!(
-                    "[exits] 📉 POSITION CLOSED [{}] | reason={} | consecutive losses: {}.",
-                    position.mint, reason, streak
-                );
+            let pnl_bps = compute_pnl_bps(
+                cur_wsol_num,
+                cur_wsol_den,
+                position.entry_price_wsol_num,
+                position.entry_price_wsol_den,
+            );
+            if is_final_exit {
+                if pnl_bps >= 0 {
+                    bot_state.consecutive_losses.store(0, Ordering::SeqCst);
+                    println!(
+                        "[exits] ✅ POSITION CLOSED [{}] | reason={} | pnl={:+}bps | loss streak RESET.",
+                        position.mint, reason, pnl_bps
+                    );
+                } else {
+                    let streak = bot_state.consecutive_losses.fetch_add(1, Ordering::SeqCst) + 1;
+                    eprintln!(
+                        "[exits] 📉 POSITION CLOSED [{}] | reason={} | pnl={:+}bps | consecutive losses: {}.",
+                        position.mint, reason, pnl_bps, streak
+                    );
+                }
             }
-            
+
             if let (Some(bot_token), Some(chat_id)) = (telegram_bot_token, telegram_chat_id) {
                 let client_clone = http_client.clone();
                 let mint_str = position.mint.clone();
-                let pnl_usd = 0.0; // PnL is tracked in SOL via math engine, would need fetching or passing down.
-                let pnl_pct = 0.0;
+                // pnl_usd is not computable here — this module has no live
+                // USD price feed, only the WSOL-lamports ratio. pnl_pct IS
+                // computable from that same ratio, so it is no longer
+                // hardcoded to 0.0 (audit 2026-08).
+                let pnl_usd = 0.0;
+                let pnl_pct = pnl_bps as f64 / 100.0;
                 let exit_reason_str = reason.to_string();
                 tokio::spawn(async move {
                     crate::telegram::send_bot_sell_alert(

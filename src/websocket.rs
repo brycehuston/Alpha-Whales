@@ -602,12 +602,24 @@ fn decode_notification(
     Ok(decoded_swaps)
 }
 
+/// Returns true when `target_mint` should be accepted (i.e. is not filtered
+/// out) by the configured target-mint allowlist.
+///
+/// REGRESSION GUARD (Critical #1, audit 2026-08): `None` means "no filter,
+/// accept everything" — the production default. `Some(vec![])` must ALSO be
+/// treated as "no filter", not as "reject everything", because an empty
+/// allowlist is never an intentional "block all swaps" configuration in
+/// this codebase; it previously arose from a config bug and silently
+/// starved every exit watcher of price ticks. A genuinely non-empty
+/// allowlist still filters normally.
 fn configured_target_matches(config: &crate::config::AppConfig, target_mint: Pubkey) -> bool {
-    config.target_mints.as_ref().is_none_or(|target_mints| {
-        target_mints
+    match config.target_mints.as_ref() {
+        None => true,
+        Some(target_mints) if target_mints.is_empty() => true,
+        Some(target_mints) => target_mints
             .iter()
-            .any(|configured| Pubkey::from_str(configured).is_ok_and(|mint| mint == target_mint))
-    })
+            .any(|configured| Pubkey::from_str(configured).is_ok_and(|mint| mint == target_mint)),
+    }
 }
 
 fn local_receipt_time_ms() -> Result<u64, String> {
@@ -1253,6 +1265,33 @@ mod tests {
         let (tx, rx) = crossbeam::channel::bounded(1);
         enqueue_decoded_swap(decoded, &tx, &config).expect("filter drop is nonfatal");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn empty_target_mints_allowlist_does_not_drop_swaps() {
+        // REGRESSION GUARD (Critical #1, audit 2026-08): `AppConfig::load_from_env`
+        // previously produced `target_mints: Some(vec![])`, which under the old
+        // `is_none_or` implementation silently rejected every swap — starving
+        // every exit watcher of price ticks in production. `Some(vec![])` must
+        // behave identically to `None` (accept everything).
+        let fixture = notification_fixture(
+            CURRENT_SWAP_ACCOUNT_COUNT,
+            RAYDIUM_SWAP_BASE_IN,
+            InstructionLocation::Outer,
+            false,
+        );
+        let decoded = decode_fixture(&fixture, 1)
+            .expect("fixture decodes")
+            .pop()
+            .expect("one swap");
+        let mut config = test_config();
+        config.target_mints = Some(vec![]);
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        enqueue_decoded_swap(decoded, &tx, &config).expect("empty allowlist must not drop swaps");
+        assert!(
+            rx.try_recv().is_ok(),
+            "an empty target_mints allowlist must be treated as unrestricted, not as reject-all"
+        );
     }
 
     #[test]

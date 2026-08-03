@@ -12,6 +12,13 @@ pub fn init_db() -> Result<(), String> {
     log::info!("[db] init_db: opening trade_telemetry.db");
     let conn = Connection::open("trade_telemetry.db")
         .map_err(|e| format!("Failed to open trade_telemetry.db: {e}"))?;
+    
+    // AUDIT FIX: MEDIUM — SQLite Hygiene
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 5000;"
+    ).map_err(|e| format!("Failed to configure SQLite PRAGMAs: {e}"))?;
+    
     log::info!("[db] init_db: connection opened successfully");
 
     // -- Phase 5 tables -------------------------------------------------------
