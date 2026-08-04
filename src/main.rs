@@ -139,6 +139,7 @@ fn load_live_executor_config() -> Result<execution::JitoExecutorConfig, error::B
     // defaulted) so an operator cannot accidentally run live execution
     // without sandwich protection configured.
     let jito_dont_front_pubkey = required_pubkey("JITO_DONT_FRONT_PUBKEY")?;
+    let pumpportal_api_key = std::env::var("PUMPPORTAL_API_KEY").ok();
 
     execution::JitoExecutorConfig::new(
         execution::DEFAULT_JITO_BLOCK_ENGINE_URL.to_string(),
@@ -150,6 +151,7 @@ fn load_live_executor_config() -> Result<execution::JitoExecutorConfig, error::B
         max_pending_capital_lamports,
         execution_journal_path,
         jito_dont_front_pubkey,
+        pumpportal_api_key,
     )
     .map(|config| config.with_alt_address(None))
     .map_err(|error| error::BotError::ConfigError(error.to_string()))

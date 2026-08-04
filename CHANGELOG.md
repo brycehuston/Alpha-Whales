@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [EXECUTION-CRITICAL-FIX] - 2026-08-03
+### Fixed
+- **Bug: Stale Journal Lock File Blocks All Trades** (`src/execution.rs` — `ExecutionJournal::load()`): The `acquire_writer_lock()` method uses `create_new(true)`, meaning any `.lock` file left on disk by a previously crashed or killed executor permanently blocks every subsequent trade attempt with "cannot acquire exclusive writer lock". Fixed by auto-deleting the stale `.lock` file on startup inside `load()`. Added a log warning in case another executor is genuinely running concurrently.
+- **Bug: PumpPortal Mint Recorded as `111...1` Default** (`src/execution.rs` — execution loop): `prepared_target_mint` was initialized to `Pubkey::default()` (the all-1s pubkey). When the Raydium path failed and the PumpPortal branch was taken, the journal recorded `111...1` as the reserved mint. This permanently blocked the real target mint from ever being retried because `journal.contains()` checked the real mint (always absent) but the `111...1` default accumulated in `reserved_mints`. Fixed by initializing `prepared_target_mint` to the parsed signal mint upfront, so both Raydium and PumpPortal branches always record the correct pubkey.
+- **Manual:** Deleted stale `execution_journal.log.lock` file from disk.
+- **Config:** `MAX_PENDING_CAPITAL_LAMPORTS=500000000` (0.5 SOL ceiling) to accommodate 0.2 SOL test fund.
+
+## [PUMPFUN-INTEGRATION] - 2026-08-03
+
+### Added
+- **PumpPortal Execution (Buy Side):** Refactored `run_whale_execution_consumer` in `execution.rs` to fallback to `resolve_pumpportal_swap` when `ROUTE_NOT_FOUND` occurs for pre-migration Pump.fun tokens. Bundles are resigned with our custom Jito tip logic via `build_and_sign_pump_bundle`.
+- **PumpPortal Execution (Sell Side):** Added `resolve_pumpportal_sell` in `exits.rs`. The exit watcher dynamically routes sells to PumpPortal using the exact token unit amount (accounting for Pump.fun's 6 decimals) if the position was acquired before Raydium migration.
+- **Dynamic Configuration:** Injected `PUMPPORTAL_API_KEY` through `config.rs`, `execution.rs`, and into `ActivePosition` to enable fallback routing across the full lifecycle.
+- **Bot Fixes & Upgrades:**
+  - Implemented Pump.fun / PumpPortal exit watcher logic in `exits.rs` to safely handle non-migrated tokens.
+  - Calculated raw token units directly (via `amount_ui`) for PumpPortal exit payloads, ensuring maximum precision and zero dust on sells.
+  - Cleared `execution_journal.log` to unblock duplicate-trade guardrails and allow fresh execution attempts.
+  - Fixed an unwrap panic in `sell_position` when encountering Pump.fun tokens.
+
 ## [EXECUTION ENGINE - MEDIUM BUGS] - 2026-08-02 23:19 PST
 ### Fixed
 - **Bug 1 (VWAP Snapback):** Added `VWAP_SNAPBACK` trigger to `run_watcher` in `exits.rs` before partial exit condition to properly exit break-even/profit trades.

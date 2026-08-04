@@ -27,6 +27,15 @@ pub struct HeliusWebhookPayload {
     pub fee_payer: String,
     pub timestamp: u64,
     pub events: Option<HeliusEvents>,
+    #[serde(rename = "tokenTransfers")]
+    pub token_transfers: Option<Vec<HeliusTokenTransfer>>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct HeliusTokenTransfer {
+    #[serde(rename = "toUserAccount")]
+    pub to_user_account: String,
+    pub mint: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -97,22 +106,38 @@ async fn handle_webhook(
             continue; 
         }
         
-        let Some(events) = trade.events else { 
-            log::info!("   [Skip] Ignored SWAP from {}: Missing 'events' data", trade.fee_payer);
-            continue; 
-        };
-        let Some(swap) = events.swap else { 
-            log::info!("   [Skip] Ignored SWAP from {}: Missing 'swap' payload", trade.fee_payer);
-            continue; 
-        };
-        let Some(token_outputs) = swap.token_outputs else { 
-            log::info!("   [Skip] Ignored SWAP from {}: Missing 'tokenOutputs' (Probably a sell or no tokens received)", trade.fee_payer);
-            continue; 
+        // Try to get token mint from events.swap first (Jupiter/Raydium)
+        let mut target_mint = None;
+        
+        if let Some(events) = &trade.events {
+            if let Some(swap) = &events.swap {
+                if let Some(token_outputs) = &swap.token_outputs {
+                    if let Some(output) = token_outputs.first() {
+                        target_mint = Some(output.mint.clone());
+                    }
+                }
+            }
+        }
+        
+        // Fallback to tokenTransfers (Pump.fun)
+        if target_mint.is_none() {
+            if let Some(transfers) = &trade.token_transfers {
+                for transfer in transfers {
+                    // Find the transfer where the whale received the token (and ignore wrapped SOL)
+                    if transfer.to_user_account == trade.fee_payer && transfer.mint != "So11111111111111111111111111111111111111112" {
+                        target_mint = Some(transfer.mint.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        
+        let Some(token_mint) = target_mint else {
+            log::info!("   [Skip] Ignored SWAP from {}: Could not determine purchased token mint", trade.fee_payer);
+            continue;
         };
         
-        if let Some(output) = token_outputs.first() {
-            let token_mint = &output.mint;
-            let whale_wallet = &trade.fee_payer;
+        let whale_wallet = &trade.fee_payer;
 
             log::info!("Received Whale Signal from {} for mint: {}", whale_wallet, token_mint);
             
@@ -134,7 +159,7 @@ async fn handle_webhook(
                 log::warn!("Wallet {} not found in watchlist. Using fallback size.", whale_wallet);
             }
 
-            let timestamp_ms = trade.timestamp * 1000;
+            let timestamp_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
 
             let signal = WhaleSignal {
                 target_mint: token_mint.clone(),
@@ -144,9 +169,8 @@ async fn handle_webhook(
                 lane: signal_lane,
             };
 
-            if let Err(e) = state.signal_tx.try_send(signal) {
-                log::error!("Failed to send WhaleSignal to execution queue (Queue Full): {}", e);
-            }
+        if let Err(e) = state.signal_tx.try_send(signal) {
+            log::error!("Failed to send WhaleSignal to execution queue (Queue Full): {}", e);
         }
     }
     

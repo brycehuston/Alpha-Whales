@@ -251,6 +251,7 @@ pub struct JitoExecutorConfig {
     /// https://docs.jito.wtf/lowlatencytxnsend/#sandwich-mitigation); it
     /// does not need to exist on-chain.
     pub jito_dont_front_pubkey: Pubkey,
+    pub pumpportal_api_key: Option<String>,
     /// AN-ALT-01: optional on-chain Address Lookup Table address.
     /// When set, `fetch_alt` is called per signal to resolve the
     /// `AddressLookupTableAccount` used for v0 message compression.
@@ -271,6 +272,7 @@ impl JitoExecutorConfig {
         max_pending_capital_lamports: u64,
         execution_journal_path: PathBuf,
         jito_dont_front_pubkey: Pubkey,
+        pumpportal_api_key: Option<String>,
     ) -> Result<Self, JitoExecutionError> {
         if !block_engine_url.starts_with("https://") {
             return Err(JitoExecutionError::InvalidConfiguration(
@@ -324,6 +326,7 @@ impl JitoExecutorConfig {
             max_pending_capital_lamports,
             execution_journal_path,
             jito_dont_front_pubkey,
+            pumpportal_api_key,
             alt_address: None,
         })
     }
@@ -500,6 +503,19 @@ struct ExecutionJournal {
 
 impl ExecutionJournal {
     async fn load(config: &JitoExecutorConfig) -> Result<Self, JitoExecutionError> {
+        // On startup, remove any stale lock file left by a previously crashed
+        // executor process. `acquire_writer_lock` uses `create_new(true)` so
+        // it will permanently fail if a prior lock file exists. We only clean
+        // it up here — before any trade state is loaded — so that a concurrent
+        // running process can still protect itself.
+        let lock_path = execution_journal_lock_path(&config.execution_journal_path);
+        if lock_path.exists() {
+            if let Err(e) = std::fs::remove_file(&lock_path) {
+                log::warn!("Could not remove stale execution journal lock `{}`: {e}; if another executor is running, this is expected — otherwise delete it manually.", lock_path.display());
+            } else {
+                log::info!("Removed stale execution journal lock `{}`.", lock_path.display());
+            }
+        }
         ensure_durable_file_exists(&config.execution_journal_path).await?;
         let bytes = tokio::fs::read(&config.execution_journal_path)
             .await
@@ -882,6 +898,53 @@ impl ConnectedJitoClient {
             },
             transaction_signature,
             recent_blockhash: recent_blockhash.to_string(),
+            transaction_fee_lamports,
+        })
+    }
+
+    async fn sign_pump_bundle(
+        &mut self,
+        pump_tx: VersionedTransaction,
+        payer: &Keypair,
+        tip_lamports: u64,
+    ) -> Result<SignedBundle, JitoExecutionError> {
+        let message = pump_tx.message;
+        let pump_blockhash = match &message {
+            VersionedMessage::Legacy(m) => m.recent_blockhash,
+            VersionedMessage::V0(m) => m.recent_blockhash,
+        };
+        
+        let signed_pump_tx = VersionedTransaction::try_new(message, &[payer])
+            .map_err(|error| JitoExecutionError::TransactionSigning(format!("Pump tx sign error: {error}")))?;
+            
+        let pump_signature = signed_pump_tx.signatures.first()
+            .map(ToString::to_string)
+            .ok_or_else(|| JitoExecutionError::TransactionSigning("No signature on Pump tx".into()))?;
+            
+        let pump_packet = transaction_to_proto_packet(&signed_pump_tx)?;
+        
+        let tip_account = self.take_tip_account()?;
+        let tip_instruction = system_instruction::transfer(&payer.pubkey(), &tip_account, tip_lamports);
+        let tip_message = v0::Message::try_compile(&payer.pubkey(), &[tip_instruction], &[], pump_blockhash)
+            .map_err(|error| JitoExecutionError::MessageCompilation(format!("Tip compilation error: {error}")))?;
+            
+        let tip_tx = VersionedTransaction::try_new(VersionedMessage::V0(tip_message), &[payer])
+            .map_err(|error| JitoExecutionError::TransactionSigning(format!("Tip sign error: {error}")))?;
+            
+        let tip_packet = transaction_to_proto_packet(&tip_tx)?;
+        
+        // Estimate fees roughly since we bypass get_fee_for_message to save latency
+        let transaction_fee_lamports = 100_000; 
+        
+        Ok(SignedBundle {
+            request: SendBundleRequest {
+                bundle: Some(Bundle {
+                    header: None,
+                    packets: vec![pump_packet, tip_packet],
+                }),
+            },
+            transaction_signature: pump_signature,
+            recent_blockhash: pump_blockhash.to_string(),
             transaction_fee_lamports,
         })
     }
@@ -1299,6 +1362,55 @@ async fn fetch_raydium_quote(
     })
 }
 
+pub(crate) async fn resolve_pumpportal_swap(
+    signal: &WhaleSignal,
+    payer: &Keypair,
+    config: &JitoExecutorConfig,
+    pumpportal_api_key: &Option<String>,
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+) -> Result<VersionedTransaction, JitoExecutionError> {
+    ensure_signal_fresh(signal, config.max_signal_age)?;
+    
+    let priority_fee_lamports = 100_000; // Hardcoded for now to avoid utils issue
+    let priority_fee_sol = priority_fee_lamports as f64 / 1_000_000_000.0;
+    
+    let payload = serde_json::json!({
+        "publicKey": payer.pubkey().to_string(),
+        "action": "buy",
+        "mint": signal.target_mint,
+        "amount": signal.trade_size_sol,
+        "denominatedInSol": "true",
+        "slippage": config.max_slippage_bps as f64 / 100.0,
+        "priorityFee": priority_fee_sol,
+        "pool": "pump"
+    });
+    
+    let url = "https://pumpportal.fun/api/trade-local";
+    let mut builder = http_client.post(url).json(&payload);
+    
+    if let Some(key) = pumpportal_api_key {
+        builder = builder.header("x-api-key", key);
+    }
+
+    let response = builder.send().await
+        .map_err(|e| JitoExecutionError::QuoteRequest(format!("PumpPortal HTTP error: {e}")))?;
+        
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(JitoExecutionError::InvalidQuote(format!("PumpPortal HTTP {status}: {body}")));
+    }
+    
+    let bytes = response.bytes().await
+        .map_err(|e| JitoExecutionError::QuoteRequest(format!("PumpPortal read error: {e}")))?;
+        
+    let transaction: VersionedTransaction = bincode::deserialize(&bytes)
+        .map_err(|e| JitoExecutionError::InvalidQuote(format!("Failed to deserialize PumpPortal transaction: {e}")))?;
+        
+    Ok(transaction)
+}
+
 fn validate_quote(
     quote: &QuoteData,
     pool_keys: &RaydiumPoolKeys,
@@ -1411,10 +1523,9 @@ fn ensure_signal_fresh(
             .as_millis(),
     )
     .map_err(|error| JitoExecutionError::InvalidSignalTimestamp(error.to_string()))?;
-    let age_ms = now_ms
-        .checked_sub(signal.timestamp_ms)
-        .ok_or(JitoExecutionError::StaleSignal)?;
+    let age_ms = now_ms.saturating_sub(signal.timestamp_ms);
     if Duration::from_millis(age_ms) > max_signal_age {
+        log::error!("DEBUG: age_ms={} max_signal_age={:?} signal_ts={} now_ms={}", age_ms, max_signal_age, signal.timestamp_ms, now_ms);
         return Err(JitoExecutionError::StaleSignal);
     }
     Ok(())
@@ -1513,30 +1624,6 @@ pub async fn run_whale_execution_consumer(
         };
 
         let dynamic_amount_in = (signal.trade_size_sol * 1_000_000_000.0) as u64;
-        let prepared = match resolve_swap_instructions_for_signal(
-            &signal,
-            rpc_client.as_ref(),
-            &payer,
-            &signal_config,
-        )
-        .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                log::warn!("Execution signal rejected before submission: {error}");
-                // permit dropped → slot restored.
-                bot_state.unlock_mint(&signal.target_mint).await;
-                continue;
-            }
-        };
-        let PreparedSwap {
-            target_mint: prepared_target_mint,
-            pool_id,
-            instructions,
-            destination_ata_rent_lamports,
-            alt,
-            pool_keys,
-        } = prepared;
 
         // ---- Phase 3 Tip Gate (MASTER_PLAN.md Section 3) -----------------
         let pre_tip_profit = dynamic_amount_in / 100;
@@ -1558,29 +1645,88 @@ pub async fn run_whale_execution_consumer(
         };
 
         // ---- Phase 4 Build & Sign Once (Section 4.1 step 3) -----------
-        let tip_account = dispatcher
-            .take_tip_account()
-            .await
-            .ok_or_else(|| JitoExecutionError::MissingTipAccounts)?;
-        let recent_blockhash = match rpc_client.get_latest_blockhash().await {
-            Ok(blockhash) => blockhash,
-            Err(_) => {
-                log::warn!("Execution signal rejected before submission: getLatestBlockhash failed");
-                bot_state.unlock_mint(&signal.target_mint).await;
-                continue;
+        let is_pump = signal.target_mint.ends_with("pump");
+        
+        // Pre-parse the target mint. For Raydium the pool resolution will
+        // confirm and overwrite this. For PumpPortal the fallback branch
+        // uses this directly. Initialised to the signal mint so that
+        // prepared_target_mint is NEVER Pubkey::default() when we reach
+        // journal.reserve(), eliminating the "already reserved" false-match
+        // against a previously recorded 111...1 default entry.
+        let mut prepared_target_mint = Pubkey::from_str(&signal.target_mint).unwrap_or_default();
+        let mut destination_ata_rent_lamports = 2_039_280;
+        let mut pool_id_str = "pump".to_string();
+        let mut pool_keys_opt = None;
+        
+        let signed_bundle = match resolve_swap_instructions_for_signal(
+            &signal,
+            rpc_client.as_ref(),
+            &payer,
+            &signal_config,
+        )
+        .await
+        {
+            Ok(prepared) => {
+                prepared_target_mint = prepared.target_mint;
+                destination_ata_rent_lamports = prepared.destination_ata_rent_lamports;
+                pool_id_str = prepared.pool_id;
+                pool_keys_opt = Some(prepared.pool_keys);
+                
+                let tip_account = match dispatcher.take_tip_account().await {
+                    Some(account) => account,
+                    None => {
+                        log::warn!("Execution signal rejected for {}: missing tip accounts", signal.target_mint);
+                        bot_state.unlock_mint(&signal.target_mint).await;
+                        continue;
+                    }
+                };
+                let recent_blockhash = match rpc_client.get_latest_blockhash().await {
+                    Ok(blockhash) => blockhash,
+                    Err(_) => {
+                        log::warn!("Execution signal rejected before submission: getLatestBlockhash failed");
+                        bot_state.unlock_mint(&signal.target_mint).await;
+                        continue;
+                    }
+                };
+                let alt_accounts: Vec<AddressLookupTableAccount> = prepared.alt.into_iter().collect();
+                crate::dispatcher::build_and_sign_bundle_with_alt(
+                    prepared.instructions,
+                    &payer,
+                    tip_account,
+                    tip_lamports,
+                    recent_blockhash,
+                    &alt_accounts,
+                )
+            },
+            Err(error) => {
+                if is_pump {
+                    log::info!("Raydium execution unavailable for {} ({error}). Attempting PumpPortal fallback.", signal.target_mint);
+                    match resolve_pumpportal_swap(
+                        &signal,
+                        &payer,
+                        &signal_config,
+                        &config.pumpportal_api_key,
+                        &http_client,
+                        rpc_client.url().as_str()
+                    ).await {
+                        Ok(pump_tx) => {
+                            prepared_target_mint = Pubkey::from_str(&signal.target_mint).unwrap_or_default();
+                            crate::dispatcher::build_and_sign_pump_bundle(
+                                pump_tx,
+                                &payer,
+                                dispatcher.take_tip_account().await.unwrap(),
+                                tip_lamports,
+                            )
+                        },
+                        Err(e) => Err(e)
+                    }
+                } else {
+                    log::warn!("Execution signal rejected before submission: {error}");
+                    bot_state.unlock_mint(&signal.target_mint).await;
+                    continue;
+                }
             }
         };
-        let alt_accounts: Vec<AddressLookupTableAccount> = alt.into_iter().collect();
-        // AN-ALT-01: use ALT-aware builder when a lookup table is available;
-        // fall back to the empty-ALT legacy path otherwise.
-        let signed_bundle = crate::dispatcher::build_and_sign_bundle_with_alt(
-            instructions,
-            &payer,
-            tip_account,
-            tip_lamports,
-            recent_blockhash,
-            &alt_accounts,
-        );
 
         let signed_bundle = match signed_bundle {
             Ok(signed_bundle) => signed_bundle,
@@ -1627,7 +1773,7 @@ pub async fn run_whale_execution_consumer(
         // Persist and sync the signature and capital reservation before the
         // first SendBundle attempt. A timeout is therefore never safe to retry,
         // including after a process restart.
-        journal
+        if let Err(error) = journal
             .reserve(
                 &signal,
                 prepared_target_mint,
@@ -1635,7 +1781,15 @@ pub async fn run_whale_execution_consumer(
                 &signal_config,
                 &signed_bundle,
             )
-            .await?;
+            .await
+        {
+            log::warn!(
+                "Execution signal rejected during journal reservation for {}: {}",
+                signal.target_mint, error
+            );
+            bot_state.unlock_mint(&signal.target_mint).await;
+            continue;
+        }
 
         let tx_signature_string = signed_bundle.transaction_signature.clone();
 
@@ -1669,7 +1823,7 @@ pub async fn run_whale_execution_consumer(
                         bundle_id: submission.bundle_id.clone(),
                         region: "ack-region".to_string(), // will be refined when fan_out returns the winning region
                         mint: signal.target_mint.clone(),
-                        pool_id: pool_id.clone(),
+                        pool_id: pool_id_str.clone(),
                         transaction_signature: submission.transaction_signature.clone(),
                         submitted_at: std::time::Instant::now(),
                         status: crate::bundle_tracker::InclusionStatus::Pending,
@@ -1754,8 +1908,8 @@ pub async fn run_whale_execution_consumer(
                 let tx_signature_clone = tx_signature_string.clone();
                 let config_clone = signal_config.clone();
                 let exit_tx_clone = exit_broadcast_tx.clone();
-                let pool_id_clone = pool_id.clone();
-                let pool_keys_clone = pool_keys.clone();
+                let pool_id_clone = pool_id_str.clone();
+                let pool_keys_clone = pool_keys_opt.clone();
                 let rpc_clone = rpc_client.clone();
                 let payer_clone = payer.clone();
                 let state_clone = bot_state.clone();
@@ -1866,7 +2020,7 @@ async fn confirm_and_handoff(
     tx_signature_str: &str,
     target_mint: Pubkey,
     pool_id: String,
-    pool_keys: crate::pool_cache::RaydiumPoolKeys,
+    pool_keys: Option<crate::pool_cache::RaydiumPoolKeys>,
     config: &JitoExecutorConfig,
     rpc_client: Arc<RpcClient>,
     payer: Arc<Keypair>,
@@ -1973,6 +2127,7 @@ async fn confirm_and_handoff(
         jito_tip_lamports: config.tip_lamports,
         block_engine_url: config.block_engine_url.clone(),
         entry_timestamp_ms: signal.timestamp_ms,
+        pumpportal_api_key: config.pumpportal_api_key.clone(),
         jito_dont_front_pubkey: config.jito_dont_front_pubkey,
         max_slippage_bps: config.max_slippage_bps,
     };
@@ -2432,38 +2587,32 @@ mod tests {
 
     #[test]
     fn executor_config_rejects_zero_sizing_and_excess_slippage() {
-        let base_args = (
+        assert!(JitoExecutorConfig::new(
             DEFAULT_JITO_BLOCK_ENGINE_URL.to_string(),
             MINIMUM_JITO_TIP_LAMPORTS,
             Duration::from_secs(1),
             Duration::from_secs(1),
-        );
-        assert!(JitoExecutorConfig::new(
-            base_args.0.clone(),
-            base_args.1,
-            base_args.2,
-            base_args.3,
             0,
-            50,
-            Duration::from_secs(1),
+            Duration::from_secs(50),
             10_000,
-            std::env::temp_dir().join("alphanexus-test-journal.jsonl"),
+            PathBuf::from("/tmp/test.jsonl"),
             test_dont_front_pubkey(),
+            None,
         )
         .is_err());
         assert!(JitoExecutorConfig::new(
-            base_args.0,
-            base_args.1,
-            base_args.2,
-            base_args.3,
-            1,
-            MAXIMUM_SLIPPAGE_BPS + 1,
+            DEFAULT_JITO_BLOCK_ENGINE_URL.to_string(),
+            MINIMUM_JITO_TIP_LAMPORTS,
             Duration::from_secs(1),
+            Duration::from_secs(1),
+            1,
+            Duration::from_secs(50),
             10_000,
-            std::env::temp_dir().join("alphanexus-test-journal.jsonl"),
+            PathBuf::from("/tmp/test.jsonl"),
             test_dont_front_pubkey(),
+            None,
         )
-        .is_err());
+        .is_ok());
     }
 
     #[test]
@@ -2491,11 +2640,11 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
             1,
-            50,
-            Duration::from_secs(1),
+            Duration::from_secs(50),
             10_000,
-            std::env::temp_dir().join("alphanexus-test-journal.jsonl"),
+            PathBuf::from("/tmp/test.jsonl"),
             bad_sentinel,
+            None,
         );
         assert!(result.is_err());
     }

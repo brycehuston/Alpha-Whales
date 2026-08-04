@@ -420,6 +420,51 @@ impl BundleDispatcher {
     }
 }
 
+pub fn build_and_sign_pump_bundle(
+    pump_tx: VersionedTransaction,
+    payer: &Keypair,
+    tip_account: Pubkey,
+    tip_lamports: u64,
+) -> Result<SignedBundle, JitoExecutionError> {
+    let message = pump_tx.message;
+    let pump_blockhash = match &message {
+        solana_sdk::message::VersionedMessage::Legacy(m) => m.recent_blockhash,
+        solana_sdk::message::VersionedMessage::V0(m) => m.recent_blockhash,
+    };
+    
+    let signed_pump_tx = VersionedTransaction::try_new(message, &[payer])
+        .map_err(|e| JitoExecutionError::TransactionSigning(format!("Pump sign error: {e}")))?;
+        
+    let pump_signature = signed_pump_tx.signatures.first()
+        .map(ToString::to_string)
+        .ok_or_else(|| JitoExecutionError::TransactionSigning("No signature on Pump tx".into()))?;
+        
+    let pump_packet = transaction_to_proto_packet(&signed_pump_tx)?;
+        
+    let tip_instruction = solana_sdk::system_instruction::transfer(&payer.pubkey(), &tip_account, tip_lamports);
+    let tip_message = solana_sdk::message::v0::Message::try_compile(&payer.pubkey(), &[tip_instruction], &[], pump_blockhash)
+        .map_err(|e| JitoExecutionError::MessageCompilation(format!("Tip compilation error: {e}")))?;
+        
+    let tip_tx = VersionedTransaction::try_new(solana_sdk::message::VersionedMessage::V0(tip_message), &[payer])
+        .map_err(|e| JitoExecutionError::TransactionSigning(format!("Tip sign error: {e}")))?;
+        
+    let tip_packet = transaction_to_proto_packet(&tip_tx)?;
+        
+    let transaction_fee_lamports = 100_000; 
+    
+    Ok(SignedBundle {
+        request: SendBundleRequest {
+            bundle: Some(Bundle {
+                header: None,
+                packets: vec![pump_packet, tip_packet],
+            }),
+        },
+        transaction_signature: pump_signature,
+        recent_blockhash: pump_blockhash.to_string(),
+        transaction_fee_lamports,
+    })
+}
+
 /// Build a `SignedBundle` from the given instructions, an ALT slice, and
 /// the remaining bundle parameters.
 ///

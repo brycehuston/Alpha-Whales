@@ -78,6 +78,7 @@ pub struct AppConfig {
     pub min_swap_lamports: u64,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
+    pub pumpportal_api_key: Option<String>,
     #[expect(dead_code, reason = "reserved for Phase 3+ runtime mode checks")]
     pub dry_run: bool,
     pub startup_policy: ShadowStartupPolicy,
@@ -131,6 +132,8 @@ impl AppConfig {
             .filter(|s| !s.is_empty());
         let telegram_chat_id = env::var("TELEGRAM_CHAT_ID").ok().filter(|s| !s.is_empty());
 
+        let pumpportal_api_key = env::var("PUMPPORTAL_API_KEY").ok().filter(|s| !s.is_empty());
+
         if telegram_bot_token.is_none() || telegram_chat_id.is_none() {
             println!("⚠️  TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — alerts disabled.");
         }
@@ -179,6 +182,7 @@ impl AppConfig {
             min_swap_lamports,
             telegram_bot_token,
             telegram_chat_id,
+            pumpportal_api_key,
             dry_run,
             startup_policy,
             watchlist: watchlist_arc,

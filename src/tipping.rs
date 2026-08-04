@@ -110,6 +110,30 @@ impl TipTelemetryEngine {
 
     async fn refresh_loop_inner(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let client = reqwest::Client::new();
+        
+        // Initial fetch before entering the sleep loop
+        let result = self.fetch_telemetry(&client).await;
+        match result {
+            Ok(telemetry) => {
+                log::info!(
+                    "Tip telemetry initial refresh: p50={}, p75={}, p95={} lamports",
+                    telemetry.p50_lamports,
+                    telemetry.p75_lamports,
+                    telemetry.p95_lamports,
+                );
+                match self.inner.telemetry.write() {
+                    Ok(mut lock) => *lock = Some(telemetry),
+                    Err(poison) => {
+                        log::warn!("Recovering poisoned tip telemetry write lock");
+                        *poison.into_inner() = Some(telemetry);
+                    }
+                }
+            }
+            Err(error) => {
+                log::warn!("Tip telemetry initial refresh failed: {error}");
+            }
+        }
+        
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,

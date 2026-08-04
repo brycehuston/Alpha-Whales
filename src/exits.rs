@@ -163,8 +163,8 @@ pub struct ActivePosition {
     pub whale_wallet: String,
     /// Source pool ID used for execution — used to filter price ticks.
     pub source_pool_id: String,
-    /// Pool keys used for the exit, pre-resolved during the buy phase.
-    pub pool_keys: RaydiumPoolKeys,
+    /// Pool keys used for the exit, pre-resolved during the buy phase. None for Pump.fun tokens.
+    pub pool_keys: Option<RaydiumPoolKeys>,
     /// Entry price: WSOL lamports received per token raw unit at buy time.
     /// Computed as `wsol_out_lamports / token_in_raw`.
     /// Stored as (numerator, denominator) to avoid precision loss.
@@ -179,6 +179,8 @@ pub struct ActivePosition {
     pub block_engine_url: String,
     /// The timestamp in milliseconds when the position was acquired.
     pub entry_timestamp_ms: u64,
+    /// PumpPortal API key for fallback selling of pre-migration tokens.
+    pub pumpportal_api_key: Option<String>,
     /// Jito don't front pubkey for MEV protection on the sell side.
     pub jito_dont_front_pubkey: solana_sdk::pubkey::Pubkey,
     /// Max slippage basis points for the exit swap.
@@ -348,10 +350,17 @@ async fn run_watcher(
 
     let pool_keys = position.pool_keys.clone();
 
-    println!(
-        "[exits] ✅ Pool keys resolved for {} (amm_id={}).",
-        position.mint, pool_keys.amm_id
-    );
+    if let Some(ref keys) = pool_keys {
+        println!(
+            "[exits] ✅ Pool keys resolved for {} (amm_id={}).",
+            position.mint, keys.amm_id
+        );
+    } else {
+        println!(
+            "[exits] 💊 Pump.fun token detected for {} (no Raydium pool keys).",
+            position.mint
+        );
+    }
 
     // -----------------------------------------------------------------------
     // VBATS State
@@ -537,7 +546,7 @@ async fn run_watcher(
             execute_sell_with_retry(
                 "PANIC_VELOCITY",
                 &position,
-                &pool_keys,
+                pool_keys.as_ref(),
                 mint_pubkey,
                 rpc_client.clone(),
                 payer.clone(),
@@ -576,7 +585,7 @@ async fn run_watcher(
             execute_sell_with_retry(
                 "VWAP_SNAPBACK",
                 &position,
-                &pool_keys,
+                pool_keys.as_ref(),
                 mint_pubkey,
                 rpc_client.clone(),
                 payer.clone(),
@@ -617,7 +626,7 @@ async fn run_watcher(
             let success = execute_sell_with_retry(
                 "ADAPTIVE_SCALE_OUT_50PCT",
                 &partial_position,
-                &pool_keys,
+                pool_keys.as_ref(),
                 mint_pubkey,
                 rpc_client.clone(),
                 payer.clone(),
@@ -713,7 +722,7 @@ async fn run_watcher(
                 execute_sell_with_retry(
                     reason,
                     &position,
-                    &pool_keys,
+                    pool_keys.as_ref(),
                     mint_pubkey,
                     rpc_client.clone(),
                     payer.clone(),
@@ -754,7 +763,7 @@ async fn run_watcher(
 async fn execute_sell_with_retry(
     reason: &str,
     position: &ActivePosition,
-    pool_keys: &RaydiumPoolKeys,
+    pool_keys: Option<&RaydiumPoolKeys>,
     mint_pubkey: Pubkey,
     rpc_client: Arc<RpcClient>,
     payer: Arc<Keypair>,
@@ -783,16 +792,8 @@ async fn execute_sell_with_retry(
         return true;
     }
 
-    let expected_wsol = (position.acquired_amount as u128)
-        .checked_mul(cur_wsol_num)
-        .unwrap_or(0) / cur_wsol_den.max(1);
-    let minimum_amount_out = crate::execution::calculate_local_minimum_amount_out(
-        expected_wsol as u64,
-        position.max_slippage_bps,
-    ).unwrap_or(1);
-
     let result = attempt_sell_bundle(
-        position, pool_keys, mint_pubkey, rpc_client.clone(), payer, minimum_amount_out
+        reason, position, pool_keys, mint_pubkey, rpc_client.clone(), payer, cur_wsol_num, cur_wsol_den
     ).await;
 
     match result {
@@ -921,12 +922,14 @@ async fn execute_sell_with_retry(
 /// Executes the full sell pipeline: build instruction → sign bundle → submit.
 /// Retries up to MAX_SELL_ATTEMPTS times with increasing Jito tip.
 async fn attempt_sell_bundle(
+    reason: &str,
     position: &ActivePosition,
-    pool_keys: &RaydiumPoolKeys,
+    pool_keys: Option<&RaydiumPoolKeys>,
     mint_pubkey: Pubkey,
     rpc_client: Arc<RpcClient>,
     payer: Arc<Keypair>,
-    minimum_amount_out: u64,
+    cur_wsol_num: u128,
+    cur_wsol_den: u128,
 ) -> Result<(String, solana_sdk::signature::Signature), ExitError> {
     // Derive ATAs for the sell: source = token ATA, destination = WSOL ATA.
     let user_owner = payer.pubkey();
@@ -968,6 +971,28 @@ async fn attempt_sell_bundle(
             }
         }
 
+        // BUGFIX (High, audit 2026-08): Re-compute minimum_amount_out and dynamic
+        // slippage tolerance per attempt. For emergency exits (PANIC_VELOCITY, HARD_STOP_20PCT),
+        // widen slippage to 30-50% rather than reusing entry-time bps (1.0-2.5%).
+        let is_emergency = reason == "PANIC_VELOCITY" || reason == "HARD_STOP_20PCT";
+        let effective_slippage_bps = if is_emergency {
+            match attempt {
+                1 => 3000, // 30%
+                2 => 4000, // 40%
+                _ => 5000, // 50%
+            }
+        } else {
+            (position.max_slippage_bps.saturating_mul(attempt as u16)).min(1000)
+        };
+
+        let expected_wsol = (position.acquired_amount as u128)
+            .checked_mul(cur_wsol_num)
+            .unwrap_or(0) / cur_wsol_den.max(1);
+        let minimum_amount_out = crate::execution::calculate_local_minimum_amount_out(
+            expected_wsol as u64,
+            effective_slippage_bps,
+        ).unwrap_or(1);
+
         // Escalate tip geometrically (1.5× per retry).
         let tip_scale = 1.5_f64.powi(attempt as i32 - 1);
         let tip_lamports = {
@@ -992,69 +1017,155 @@ async fn attempt_sell_bundle(
             }
         };
 
-        // Build the sell instruction: Token → WSOL.
-        let mut swap_ix = match construct_raydium_swap_instruction(
-            pool_keys,
-            user_owner,
-            user_source_token_account,
-            user_destination_wsol_account,
-            position.acquired_amount,
-            minimum_amount_out,
-        ) {
-            Ok(ix) => ix,
-            Err(err) => {
-                return Err(ExitError::TxBuild(format!(
-                    "construct_raydium_swap_instruction: {err}"
-                )));
+        let mut packets = Vec::new();
+        let mut main_signature = solana_sdk::signature::Signature::default();
+
+        if let Some(keys) = pool_keys {
+            // Build the sell instruction: Token → WSOL.
+            let mut swap_ix = match construct_raydium_swap_instruction(
+                keys,
+                user_owner,
+                user_source_token_account,
+                user_destination_wsol_account,
+                position.acquired_amount,
+                minimum_amount_out,
+            ) {
+                Ok(ix) => ix,
+                Err(err) => {
+                    return Err(ExitError::TxBuild(format!(
+                        "construct_raydium_swap_instruction: {err}"
+                    )));
+                }
+            };
+
+            if let Err(e) = crate::execution::apply_jitodontfront_protection(&mut swap_ix, position.jito_dont_front_pubkey) {
+                eprintln!("[exits] ⚠️ Failed to apply MEV protection: {}", e);
             }
-        };
 
-        if let Err(e) = crate::execution::apply_jitodontfront_protection(&mut swap_ix, position.jito_dont_front_pubkey) {
-            eprintln!("[exits] ⚠️ Failed to apply MEV protection: {}", e);
-        }
+            // Select the next tip account (round-robin).
+            let tip_account = jito.tip_accounts[jito.next_tip_index];
+            jito.next_tip_index = (jito.next_tip_index + 1) % jito.tip_accounts.len();
 
-        // Select the next tip account (round-robin).
-        let tip_account = jito.tip_accounts[jito.next_tip_index];
-        jito.next_tip_index = (jito.next_tip_index + 1) % jito.tip_accounts.len();
+            let tip_ix = system_instruction::transfer(&user_owner, &tip_account, tip_lamports);
 
-        let tip_ix = system_instruction::transfer(&user_owner, &tip_account, tip_lamports);
+            let instructions: Vec<Instruction> = vec![swap_ix, tip_ix];
 
-        let instructions: Vec<Instruction> = vec![swap_ix, tip_ix];
+            // Compile and sign.
+            let message =
+                match v0::Message::try_compile(&user_owner, &instructions, &[], recent_blockhash) {
+                    Ok(m) => m,
+                    Err(err) => {
+                        last_error = format!("message compile: {err}");
+                        eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
+                        continue;
+                    }
+                };
+            let transaction =
+                match VersionedTransaction::try_new(VersionedMessage::V0(message), &[payer.as_ref()]) {
+                    Ok(tx) => tx,
+                    Err(err) => {
+                        last_error = format!("tx sign: {err}");
+                        eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
+                        continue;
+                    }
+                };
 
-        // Compile and sign.
-        let message =
-            match v0::Message::try_compile(&user_owner, &instructions, &[], recent_blockhash) {
-                Ok(m) => m,
+            // Serialize to proto packet.
+            let packet = match transaction_to_proto_packet(&transaction) {
+                Ok(p) => p,
                 Err(err) => {
-                    last_error = format!("message compile: {err}");
+                    last_error = format!("serialization: {err}");
                     eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
                     continue;
                 }
             };
-        let transaction =
-            match VersionedTransaction::try_new(VersionedMessage::V0(message), &[payer.as_ref()]) {
-                Ok(tx) => tx,
-                Err(err) => {
-                    last_error = format!("tx sign: {err}");
+            
+            packets.push(packet);
+            main_signature = transaction.signatures[0];
+        } else {
+            // PumpPortal fallback
+            // Pump.fun tokens always have 6 decimals.
+            let amount_ui = position.acquired_amount as f64 / 1_000_000.0;
+            let priority_fee_sol = tip_lamports as f64 / 1_000_000_000.0;
+            
+            let payload = serde_json::json!({
+                "publicKey": payer.pubkey().to_string(),
+                "action": "sell",
+                "mint": position.mint,
+                "amount": amount_ui,
+                "denominatedInSol": "false",
+                "slippage": effective_slippage_bps as f64 / 100.0,
+                "priorityFee": priority_fee_sol,
+                "pool": "pump"
+            });
+            
+            let url = "https://pumpportal.fun/api/trade-local";
+            let mut builder = reqwest::Client::new().post(url).json(&payload);
+            
+            if let Some(key) = &position.pumpportal_api_key {
+                builder = builder.header("x-api-key", key);
+            }
+            
+            let response = match builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = format!("PumpPortal HTTP error: {e}");
                     eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
                     continue;
                 }
             };
-
-        // Serialize to proto packet.
-        let packet = match transaction_to_proto_packet(&transaction) {
-            Ok(p) => p,
-            Err(err) => {
-                last_error = format!("serialization: {err}");
+            
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                last_error = format!("PumpPortal HTTP {status}: {body}");
                 eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
                 continue;
             }
-        };
+            
+            let bytes = match response.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    last_error = format!("PumpPortal read error: {e}");
+                    eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
+                    continue;
+                }
+            };
+            
+            let pump_tx: VersionedTransaction = match bincode::deserialize(&bytes) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    last_error = format!("PumpPortal deserialize error: {e}");
+                    eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
+                    continue;
+                }
+            };
+            
+            let tip_account = jito.tip_accounts[jito.next_tip_index];
+            jito.next_tip_index = (jito.next_tip_index + 1) % jito.tip_accounts.len();
+            
+            let signed_bundle = match crate::dispatcher::build_and_sign_pump_bundle(
+                pump_tx,
+                &payer,
+                tip_account,
+                tip_lamports,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    last_error = format!("build_and_sign_pump_bundle: {e}");
+                    eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
+                    continue;
+                }
+            };
+            
+            packets = signed_bundle.request.bundle.unwrap().packets;
+            main_signature = solana_sdk::signature::Signature::from_str(&signed_bundle.transaction_signature).unwrap_or_default();
+        }
 
         let bundle_request = SendBundleRequest {
             bundle: Some(Bundle {
                 header: None,
-                packets: vec![packet],
+                packets,
             }),
         };
 
@@ -1073,8 +1184,7 @@ async fn attempt_sell_bundle(
                     eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
                     continue;
                 }
-                let sig = transaction.signatures[0];
-                return Ok((bundle_id, sig));
+                return Ok((bundle_id, main_signature));
             }
             Ok(Err(status)) => {
                 last_error = format!("gRPC status: {status}");
