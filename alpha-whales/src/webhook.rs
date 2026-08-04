@@ -1,4 +1,4 @@
-use crate::types::WhaleSignal;
+use alpha_agents_core::types::WhaleSignal;
 use axum::{
     extract::{State, Json},
     http::{HeaderMap, StatusCode},
@@ -16,7 +16,7 @@ use subtle::ConstantTimeEq;
 pub struct WebhookState {
     pub signal_tx: Sender<WhaleSignal>,
     pub api_key: String,
-    pub watchlist: Arc<DashMap<String, crate::config::WhaleProfile>>,
+    pub watchlist: Arc<DashMap<String, alpha_agents_core::config::WhaleProfile>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -143,15 +143,15 @@ async fn handle_webhook(
             
             // Look up the whale in our dynamic sizing watchlist
             let mut trade_size_lamports = 10_000_000.0; // Default 0.01 SOL fallback
-            let mut signal_lane = crate::config::WhaleLane::Unknown;
+            let mut signal_lane = alpha_agents_core::config::WhaleLane::Unknown;
             
             if let Some(profile) = state.watchlist.get(whale_wallet) {
                 signal_lane = profile.lane;
                 trade_size_lamports = match profile.lane {
-                    crate::config::WhaleLane::Conservative => 30_000_000.0, // 0.03 SOL
-                    crate::config::WhaleLane::Swing => 20_000_000.0,       // 0.02 SOL
-                    crate::config::WhaleLane::Degen => 10_000_000.0,       // 0.01 SOL
-                    crate::config::WhaleLane::Sniper => 50_000_000.0,      // 0.05 SOL (Highest confidence)
+                    alpha_agents_core::config::WhaleLane::Conservative => 30_000_000.0, // 0.03 SOL
+                    alpha_agents_core::config::WhaleLane::Swing => 20_000_000.0,       // 0.02 SOL
+                    alpha_agents_core::config::WhaleLane::Degen => 10_000_000.0,       // 0.01 SOL
+                    alpha_agents_core::config::WhaleLane::Sniper => 50_000_000.0,      // 0.05 SOL (Highest confidence)
                     _ => 10_000_000.0, // 0.01 SOL
                 };
                 log::info!("🐋 Whale Lane: {:?} | Dynamically sized trade to {} lamports", profile.lane, trade_size_lamports);

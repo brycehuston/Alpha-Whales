@@ -25,13 +25,14 @@
 //     `ConnectedJitoClient` pattern from execution.rs to stay on the same
 //     MEV-proof Jito bundle path as the buy.
 
-use crate::{
+use alpha_agents_core::{
     db,
-    execution::{construct_raydium_swap_instruction, MINIMUM_JITO_TIP_LAMPORTS},
     pool_cache::{RaydiumPoolKeys, WSOL_MINT},
     state::BotState,
     types::SwapEvent,
 };
+use crate::execution::{construct_raydium_swap_instruction, MINIMUM_JITO_TIP_LAMPORTS};
+
 
 use jito_protos::{
     bundle::Bundle,
@@ -892,7 +893,7 @@ async fn execute_sell_with_retry(
                 let pnl_pct = pnl_bps as f64 / 100.0;
                 let exit_reason_str = reason.to_string();
                 tokio::spawn(async move {
-                    crate::telegram::send_bot_sell_alert(
+                    alpha_agents_core::telegram::send_bot_sell_alert(
                         &client_clone,
                         &bot_token,
                         &chat_id,
@@ -1144,7 +1145,7 @@ async fn attempt_sell_bundle(
             let tip_account = jito.tip_accounts[jito.next_tip_index];
             jito.next_tip_index = (jito.next_tip_index + 1) % jito.tip_accounts.len();
             
-            let signed_bundle = match crate::dispatcher::build_and_sign_pump_bundle(
+            let signed_bundle = match alpha_agents_core::dispatcher::build_and_sign_pump_bundle(
                 pump_tx,
                 &payer,
                 tip_account,

@@ -1,8 +1,5 @@
-use alpha_agents_core::dispatcher::{BundleError, SignedBundle, transaction_to_proto_packet};
-
-use crate::{
+use alpha_agents_core::{
     db,
-    exits::{self, ActivePosition},
     pool_cache::{
         fetch_alt, resolve_pool_keys, PoolKeyValidationError, PoolResolutionError, RaydiumPoolKeys,
         WSOL_MINT,
@@ -10,6 +7,9 @@ use crate::{
     state::BotState,
     types::{WhaleSignal, SwapEvent},
 };
+use crate::exits::{self, ActivePosition};
+
+use alpha_agents_core::dispatcher::{BundleError, SignedBundle, transaction_to_proto_packet};
 
 use jito_protos::{
     bundle::Bundle,
@@ -56,7 +56,7 @@ use tonic::{
 
 pub const DEFAULT_JITO_BLOCK_ENGINE_URL: &str = "https://amsterdam.mainnet.block-engine.jito.wtf";
 pub const MINIMUM_JITO_TIP_LAMPORTS: u64 = 1_000;
-pub use crate::pool_cache::RAYDIUM_LIQUIDITY_POOL_V4_PROGRAM_ID;
+pub use alpha_agents_core::pool_cache::RAYDIUM_LIQUIDITY_POOL_V4_PROGRAM_ID;
 
 const SOLANA_PACKET_DATA_SIZE: usize = 1_232;
 const RAYDIUM_SWAP_BASE_IN_DISCRIMINATOR: u8 = 9;
@@ -361,6 +361,9 @@ pub enum JitoExecutionError {
     #[error(transparent)]
     BundleProtection(#[from] BundleProtectionError),
 
+    #[error(transparent)]
+    BundleBuild(#[from] alpha_agents_core::dispatcher::BundleError),
+
     #[error("invalid Raydium swap amount: {0}")]
     InvalidSwapAmount(&'static str),
 
@@ -424,7 +427,6 @@ pub enum JitoExecutionError {
     #[error("Jito Block Engine returned an invalid tip account {account}: {reason}")]
     #[allow(dead_code)]
     InvalidTipAccount { account: String, reason: String },
-
     #[error("Jito gRPC request timed out during {0}")]
     #[allow(dead_code)]
     RequestTimeout(&'static str),
@@ -780,6 +782,7 @@ struct ConnectedJitoClient {
     next_tip_account: usize,
 }
 
+
 #[allow(dead_code)]
 impl ConnectedJitoClient {
     async fn connect(config: &JitoExecutorConfig) -> Result<Self, JitoExecutionError> {
@@ -976,36 +979,7 @@ impl ConnectedJitoClient {
     }
 }
 
-pub(crate) fn transaction_to_proto_packet(
-    transaction: &VersionedTransaction,
-) -> Result<ProtoPacket, JitoExecutionError> {
-    let data = bincode::serialize(transaction)
-        .map_err(|error| JitoExecutionError::TransactionSerialization(error.to_string()))?;
 
-    if data.len() > SOLANA_PACKET_DATA_SIZE {
-        return Err(JitoExecutionError::TransactionTooLarge {
-            actual: data.len(),
-            maximum: SOLANA_PACKET_DATA_SIZE,
-        });
-    }
-
-    let size = u64::try_from(data.len()).map_err(|error| {
-        JitoExecutionError::TransactionSerialization(format!(
-            "transaction packet length conversion failed: {error}"
-        ))
-    })?;
-
-    Ok(ProtoPacket {
-        data,
-        meta: Some(ProtoMeta {
-            size,
-            addr: String::new(),
-            port: 0,
-            flags: None,
-            sender_stake: 0,
-        }),
-    })
-}
 
 pub fn construct_raydium_swap_instruction(
     pool_keys: &RaydiumPoolKeys,
@@ -1135,7 +1109,7 @@ struct PreparedSwap {
     /// Resolved ALT for this pool, if `config.alt_address` is configured
     /// legacy message (no compression).
     alt: Option<AddressLookupTableAccount>,
-    pool_keys: crate::pool_cache::RaydiumPoolKeys,
+    pool_keys: alpha_agents_core::pool_cache::RaydiumPoolKeys,
 }
 
 async fn resolve_swap_instructions_for_signal(
@@ -1545,10 +1519,10 @@ pub async fn run_whale_execution_consumer(
     config: JitoExecutorConfig,
     bot_state: Arc<BotState>,
     exit_broadcast_tx: broadcast::Sender<SwapEvent>,
-    tip_engine: crate::tipping::TipTelemetryEngine,
-    mut dispatcher: crate::dispatcher::BundleDispatcher,
+    tip_engine: alpha_agents_core::tipping::TipTelemetryEngine,
+    mut dispatcher: alpha_agents_core::dispatcher::BundleDispatcher,
     dry_run: bool,
-    bundle_tracker: Option<Arc<crate::bundle_tracker::BundleTracker>>,
+    bundle_tracker: Option<Arc<alpha_agents_core::bundle_tracker::BundleTracker>>,
     http_client: reqwest::Client,
     telegram_bot_token: Option<String>,
     telegram_chat_id: Option<String>,
@@ -1610,10 +1584,10 @@ pub async fn run_whale_execution_consumer(
 
         let mut signal_config = config.clone();
         signal_config.max_slippage_bps = match signal.lane {
-            crate::config::WhaleLane::Sniper => 250, // 2.5%
-            crate::config::WhaleLane::Degen => 200,  // 2.0%
-            crate::config::WhaleLane::Swing => 150,  // 1.5%
-            crate::config::WhaleLane::Conservative => 100, // 1.0%
+            alpha_agents_core::config::WhaleLane::Sniper => 250, // 2.5%
+            alpha_agents_core::config::WhaleLane::Degen => 200,  // 2.0%
+            alpha_agents_core::config::WhaleLane::Swing => 150,  // 1.5%
+            alpha_agents_core::config::WhaleLane::Conservative => 100, // 1.0%
             _ => config.max_slippage_bps,
         };
 
@@ -1624,11 +1598,11 @@ pub async fn run_whale_execution_consumer(
         let tip_decision =
             tip_engine.calculate_tip(pre_tip_profit, tokio::time::Instant::now().into_std());
         let tip_lamports = match tip_decision {
-            crate::tipping::TipDecision::Bid {
+            alpha_agents_core::tipping::TipDecision::Bid {
                 lamports,
                 telemetry_age_ms: _,
             } => lamports,
-            crate::tipping::TipDecision::Skip { reason } => {
+            alpha_agents_core::tipping::TipDecision::Skip { reason } => {
                 log::warn!(
                     "Execution signal rejected for {}: tip gate reason={:?}",
                     signal.target_mint, reason
@@ -1683,14 +1657,14 @@ pub async fn run_whale_execution_consumer(
                     }
                 };
                 let alt_accounts: Vec<AddressLookupTableAccount> = prepared.alt.into_iter().collect();
-                crate::dispatcher::build_and_sign_bundle_with_alt(
+                alpha_agents_core::dispatcher::build_and_sign_bundle_with_alt(
                     prepared.instructions,
                     &payer,
                     tip_account,
                     tip_lamports,
                     recent_blockhash,
                     &alt_accounts,
-                )
+                ).map_err(Into::into)
             },
             Err(error) => {
                 if is_pump {
@@ -1705,14 +1679,14 @@ pub async fn run_whale_execution_consumer(
                     ).await {
                         Ok(pump_tx) => {
                             prepared_target_mint = Pubkey::from_str(&signal.target_mint).unwrap_or_default();
-                            crate::dispatcher::build_and_sign_pump_bundle(
+                            alpha_agents_core::dispatcher::build_and_sign_pump_bundle(
                                 pump_tx,
                                 &payer,
                                 dispatcher.take_tip_account().await.unwrap(),
                                 tip_lamports,
-                            )
+                            ).map_err(Into::into)
                         },
-                        Err(e) => Err(e.into())
+                        Err(e) => Err(e)
                     }
                 } else {
                     log::warn!("Execution signal rejected before submission: {error}");
@@ -1750,7 +1724,7 @@ pub async fn run_whale_execution_consumer(
         // the bundle is fully built and signed — means dedupe now only
         // blocks genuine re-submission of an opportunity we already
         // committed capital to (MASTER_PLAN.md Section 4.6).
-        let opp_key = crate::dispatcher::OpportunityKey {
+        let opp_key = alpha_agents_core::dispatcher::OpportunityKey {
             mint: signal.target_mint.clone(),
             pool: signal.whale_wallet.clone(),
             signal_epoch_secs: signal.timestamp_ms / 1000,
@@ -1809,18 +1783,18 @@ pub async fn run_whale_execution_consumer(
                 // Jito's SubscribeBundleResults stream can verify landing
                 // independently of the RPC-based transaction confirmation below.
                 let mut bundle_landed_rx =
-                    None::<tokio::sync::mpsc::Receiver<crate::bundle_tracker::BundleRecord>>;
+                    None::<tokio::sync::mpsc::Receiver<alpha_agents_core::bundle_tracker::BundleRecord>>;
                 let mut bundle_slot = None::<u64>;
                 let mut bundle_region = None::<String>;
                 if let Some(ref tracker) = bundle_tracker {
-                    let bundle_record = crate::bundle_tracker::BundleRecord {
+                    let bundle_record = alpha_agents_core::bundle_tracker::BundleRecord {
                         bundle_id: submission.bundle_id.clone(),
                         region: "ack-region".to_string(), // will be refined when fan_out returns the winning region
                         mint: signal.target_mint.clone(),
                         pool_id: pool_id_str.clone(),
                         transaction_signature: submission.transaction_signature.clone(),
                         submitted_at: std::time::Instant::now(),
-                        status: crate::bundle_tracker::InclusionStatus::Pending,
+                        status: alpha_agents_core::bundle_tracker::InclusionStatus::Pending,
                         notify_tx: None,
                     };
                     let rx = tracker.register_bundle(bundle_record).await;
@@ -1959,7 +1933,7 @@ pub async fn run_whale_execution_consumer(
                                 let sig_str = tx_signature_clone.clone();
                                 let trade_size = format!("Bot Trade: {} SOL", size_sol);
                                 tokio::spawn(async move {
-                                    crate::telegram::send_telegram_alert(
+                                    alpha_agents_core::telegram::send_telegram_alert(
                                         &client_clone,
                                         &bot_token,
                                         &chat_id,
@@ -2014,7 +1988,7 @@ async fn confirm_and_handoff(
     tx_signature_str: &str,
     target_mint: Pubkey,
     pool_id: String,
-    pool_keys: Option<crate::pool_cache::RaydiumPoolKeys>,
+    pool_keys: Option<alpha_agents_core::pool_cache::RaydiumPoolKeys>,
     config: &JitoExecutorConfig,
     rpc_client: Arc<RpcClient>,
     payer: Arc<Keypair>,
@@ -2289,7 +2263,7 @@ async fn read_token_account_balance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
+    use alpha_agents_core::{
         shadow_logger::{
             initialize_shadow_candidate_writer, ShadowCandidateMetrics, ShadowRunId,
             SHADOW_CANDIDATE_QUEUE_CAPACITY,
@@ -2570,7 +2544,7 @@ mod tests {
 
     #[test]
     fn worst_case_quote_must_still_meet_trigger() {
-        let baseline = crate::types::VwapBaseline {
+        let baseline = alpha_agents_core::types::VwapBaseline {
             quote_sum: 1_000,
             base_sum: 100,
         };
