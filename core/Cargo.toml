@@ -9,7 +9,6 @@ path = "src/lib.rs"
 
 
 [dependencies]
-async-trait.workspace           = true
 tokio.workspace                 = true
 tokio-tungstenite.workspace     = true
 futures-util.workspace          = true
@@ -36,3 +35,7 @@ log.workspace                   = true
 env_logger.workspace            = true
 dashmap.workspace               = true
 subtle.workspace                = true
+
+# --- NEW GEYSER DEPENDENCIES ---
+yellowstone-grpc-client = "1.12.0"
+yellowstone-grpc-proto = "1.12.0"

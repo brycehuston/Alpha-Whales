@@ -25,14 +25,13 @@
 //     `ConnectedJitoClient` pattern from execution.rs to stay on the same
 //     MEV-proof Jito bundle path as the buy.
 
+use crate::execution::{construct_raydium_swap_instruction, MINIMUM_JITO_TIP_LAMPORTS};
 use alpha_agents_core::{
     db,
     pool_cache::{RaydiumPoolKeys, WSOL_MINT},
     state::BotState,
     types::SwapEvent,
 };
-use crate::execution::{construct_raydium_swap_instruction, MINIMUM_JITO_TIP_LAMPORTS};
-
 
 use jito_protos::{
     bundle::Bundle,
@@ -157,11 +156,6 @@ const PROFIT_LOCK_FLOOR_MULT: f64 = 1.10;
 pub struct ActivePosition {
     /// Base58 mint address of the token being held.
     pub mint: String,
-    /// Whale wallet whose signal triggered this position. Persisted so the
-    /// sell-side telemetry write (`db::log_trade_telemetry`) can be
-    /// attributed back to the same wallet as the buy-side write, which is
-    /// what `feedback_loop.py`'s toxic-wallet pruning query groups by.
-    pub whale_wallet: String,
     /// Source pool ID used for execution — used to filter price ticks.
     pub source_pool_id: String,
     /// Pool keys used for the exit, pre-resolved during the buy phase. None for Pump.fun tokens.
@@ -290,7 +284,16 @@ pub fn spawn_position_watcher(
         let result = timeout(
             WATCHER_MAX_LIFETIME,
             run_watcher(
-                position, price_rx, rpc_client, payer, bot_state, permit, dry_run, http_client, telegram_bot_token, telegram_chat_id,
+                position,
+                price_rx,
+                rpc_client,
+                payer,
+                bot_state,
+                permit,
+                dry_run,
+                http_client,
+                telegram_bot_token,
+                telegram_chat_id,
             ),
         )
         .await;
@@ -609,8 +612,9 @@ async fn run_watcher(
         // If Time-Weighted ROI >= 100% and elapsed time <= 60 seconds, we hit parabolic velocity.
         // Scale out 50% of the bag to lock in initial capital instantly.
         let elapsed_secs = now_ms.saturating_sub(position.entry_timestamp_ms) / 1000;
-        let roi = (cur_wsol_num as f64 * position.entry_price_wsol_den as f64) 
-                / (cur_wsol_den as f64 * position.entry_price_wsol_num as f64) - 1.0;
+        let roi = (cur_wsol_num as f64 * position.entry_price_wsol_den as f64)
+            / (cur_wsol_den as f64 * position.entry_price_wsol_num as f64)
+            - 1.0;
 
         if !partial_sold && roi >= 1.0 && elapsed_secs <= 60 {
             println!(
@@ -618,7 +622,7 @@ async fn run_watcher(
                  Scaling out 50% of the bag to lock in initial capital.",
                 elapsed_secs, position.mint
             );
-            
+
             // Halve the acquired amount for the partial sell
             let partial_amount = position.acquired_amount / 2;
             let mut partial_position = position.clone();
@@ -794,8 +798,16 @@ async fn execute_sell_with_retry(
     }
 
     let result = attempt_sell_bundle(
-        reason, position, pool_keys, mint_pubkey, rpc_client.clone(), payer, cur_wsol_num, cur_wsol_den
-    ).await;
+        reason,
+        position,
+        pool_keys,
+        mint_pubkey,
+        rpc_client.clone(),
+        payer,
+        cur_wsol_num,
+        cur_wsol_den,
+    )
+    .await;
 
     match result {
         Ok((bundle_id, signature)) => {
@@ -803,14 +815,22 @@ async fn execute_sell_with_retry(
                 "[exits] ✅ Sell bundle ACCEPTED ({}) for {} | bundle_id={}.",
                 reason, position.mint, bundle_id
             );
-            println!("[exits] ⏳ Waiting for on-chain confirmation of signature: {}", signature);
+            println!(
+                "[exits] ⏳ Waiting for on-chain confirmation of signature: {}",
+                signature
+            );
 
             let mut confirmed = false;
             for _ in 0..15 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 if let Ok(response) = rpc_client.get_signature_statuses(&[signature]).await {
                     if let Some(Some(status)) = response.value.first() {
-                        if status.satisfies_commitment(solana_sdk::commitment_config::CommitmentConfig { commitment: solana_sdk::commitment_config::CommitmentLevel::Confirmed }) {
+                        if status.satisfies_commitment(
+                            solana_sdk::commitment_config::CommitmentConfig {
+                                commitment:
+                                    solana_sdk::commitment_config::CommitmentLevel::Confirmed,
+                            },
+                        ) {
                             if status.err.is_none() {
                                 confirmed = true;
                             }
@@ -821,7 +841,10 @@ async fn execute_sell_with_retry(
             }
 
             if !confirmed {
-                eprintln!("[exits] 🚨 Sell bundle {} was accepted but DID NOT CONFIRM on-chain.", bundle_id);
+                eprintln!(
+                    "[exits] 🚨 Sell bundle {} was accepted but DID NOT CONFIRM on-chain.",
+                    bundle_id
+                );
                 return false;
             }
 
@@ -902,7 +925,8 @@ async fn execute_sell_with_retry(
                         pnl_pct,
                         &exit_reason_str,
                         0.0,
-                    ).await;
+                    )
+                    .await;
                 });
             }
         }
@@ -988,11 +1012,13 @@ async fn attempt_sell_bundle(
 
         let expected_wsol = (position.acquired_amount as u128)
             .checked_mul(cur_wsol_num)
-            .unwrap_or(0) / cur_wsol_den.max(1);
+            .unwrap_or(0)
+            / cur_wsol_den.max(1);
         let minimum_amount_out = crate::execution::calculate_local_minimum_amount_out(
             expected_wsol as u64,
             effective_slippage_bps,
-        ).unwrap_or(1);
+        )
+        .unwrap_or(1);
 
         // Escalate tip geometrically (1.5× per retry).
         let tip_scale = 1.5_f64.powi(attempt as i32 - 1);
@@ -1019,7 +1045,7 @@ async fn attempt_sell_bundle(
         };
 
         let mut packets = Vec::new();
-        let mut main_signature = solana_sdk::signature::Signature::default();
+        let main_signature;
 
         if let Some(keys) = pool_keys {
             // Build the sell instruction: Token → WSOL.
@@ -1039,7 +1065,10 @@ async fn attempt_sell_bundle(
                 }
             };
 
-            if let Err(e) = crate::execution::apply_jitodontfront_protection(&mut swap_ix, position.jito_dont_front_pubkey) {
+            if let Err(e) = crate::execution::apply_jitodontfront_protection(
+                &mut swap_ix,
+                position.jito_dont_front_pubkey,
+            ) {
                 eprintln!("[exits] ⚠️ Failed to apply MEV protection: {}", e);
             }
 
@@ -1061,15 +1090,17 @@ async fn attempt_sell_bundle(
                         continue;
                     }
                 };
-            let transaction =
-                match VersionedTransaction::try_new(VersionedMessage::V0(message), &[payer.as_ref()]) {
-                    Ok(tx) => tx,
-                    Err(err) => {
-                        last_error = format!("tx sign: {err}");
-                        eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
-                        continue;
-                    }
-                };
+            let transaction = match VersionedTransaction::try_new(
+                VersionedMessage::V0(message),
+                &[payer.as_ref()],
+            ) {
+                Ok(tx) => tx,
+                Err(err) => {
+                    last_error = format!("tx sign: {err}");
+                    eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
+                    continue;
+                }
+            };
 
             // Serialize to proto packet.
             let packet = match transaction_to_proto_packet(&transaction) {
@@ -1080,7 +1111,7 @@ async fn attempt_sell_bundle(
                     continue;
                 }
             };
-            
+
             packets.push(packet);
             main_signature = transaction.signatures[0];
         } else {
@@ -1088,7 +1119,7 @@ async fn attempt_sell_bundle(
             // Pump.fun tokens always have 6 decimals.
             let amount_ui = position.acquired_amount as f64 / 1_000_000.0;
             let priority_fee_sol = tip_lamports as f64 / 1_000_000_000.0;
-            
+
             let payload = serde_json::json!({
                 "publicKey": payer.pubkey().to_string(),
                 "action": "sell",
@@ -1099,14 +1130,14 @@ async fn attempt_sell_bundle(
                 "priorityFee": priority_fee_sol,
                 "pool": "pump"
             });
-            
+
             let url = "https://pumpportal.fun/api/trade-local";
             let mut builder = reqwest::Client::new().post(url).json(&payload);
-            
+
             if let Some(key) = &position.pumpportal_api_key {
                 builder = builder.header("x-api-key", key);
             }
-            
+
             let response = match builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -1115,7 +1146,7 @@ async fn attempt_sell_bundle(
                     continue;
                 }
             };
-            
+
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
@@ -1123,7 +1154,7 @@ async fn attempt_sell_bundle(
                 eprintln!("[exits] ⚠️  {} on attempt {}.", last_error, attempt);
                 continue;
             }
-            
+
             let bytes = match response.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
@@ -1132,7 +1163,7 @@ async fn attempt_sell_bundle(
                     continue;
                 }
             };
-            
+
             let pump_tx: VersionedTransaction = match bincode::deserialize(&bytes) {
                 Ok(tx) => tx,
                 Err(e) => {
@@ -1141,10 +1172,10 @@ async fn attempt_sell_bundle(
                     continue;
                 }
             };
-            
+
             let tip_account = jito.tip_accounts[jito.next_tip_index];
             jito.next_tip_index = (jito.next_tip_index + 1) % jito.tip_accounts.len();
-            
+
             let signed_bundle = match alpha_agents_core::dispatcher::build_and_sign_pump_bundle(
                 pump_tx,
                 &payer,
@@ -1158,9 +1189,11 @@ async fn attempt_sell_bundle(
                     continue;
                 }
             };
-            
+
             packets = signed_bundle.request.bundle.unwrap().packets;
-            main_signature = solana_sdk::signature::Signature::from_str(&signed_bundle.transaction_signature).unwrap_or_default();
+            main_signature =
+                solana_sdk::signature::Signature::from_str(&signed_bundle.transaction_signature)
+                    .unwrap_or_default();
         }
 
         let bundle_request = SendBundleRequest {

@@ -1,3 +1,4 @@
+use crate::exits::{self, ActivePosition};
 use alpha_agents_core::{
     db,
     pool_cache::{
@@ -5,15 +6,13 @@ use alpha_agents_core::{
         WSOL_MINT,
     },
     state::BotState,
-    types::{WhaleSignal, SwapEvent},
+    types::{SwapEvent, WhaleSignal},
 };
-use crate::exits::{self, ActivePosition};
 
-use alpha_agents_core::dispatcher::{BundleError, SignedBundle, transaction_to_proto_packet};
+use alpha_agents_core::dispatcher::{transaction_to_proto_packet, SignedBundle};
 
 use jito_protos::{
     bundle::Bundle,
-    packet::{Meta as ProtoMeta, Packet as ProtoPacket},
     searcher::{
         searcher_service_client::SearcherServiceClient, GetTipAccountsRequest, SendBundleRequest,
     },
@@ -43,12 +42,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::{
-    fs::OpenOptions,
-    io::AsyncWriteExt,
-    sync::broadcast,
-    time::timeout,
-};
+use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::broadcast, time::timeout};
 use tonic::{
     transport::{Channel, ClientTlsConfig, Endpoint},
     Request,
@@ -58,7 +52,6 @@ pub const DEFAULT_JITO_BLOCK_ENGINE_URL: &str = "https://amsterdam.mainnet.block
 pub const MINIMUM_JITO_TIP_LAMPORTS: u64 = 1_000;
 pub use alpha_agents_core::pool_cache::RAYDIUM_LIQUIDITY_POOL_V4_PROGRAM_ID;
 
-const SOLANA_PACKET_DATA_SIZE: usize = 1_232;
 const RAYDIUM_SWAP_BASE_IN_DISCRIMINATOR: u8 = 9;
 const RAYDIUM_SWAP_BASE_IN_DATA_LEN: usize = 17;
 const MAXIMUM_SLIPPAGE_BPS: u16 = 500;
@@ -517,7 +510,10 @@ impl ExecutionJournal {
             if let Err(e) = std::fs::remove_file(&lock_path) {
                 log::warn!("Could not remove stale execution journal lock `{}`: {e}; if another executor is running, this is expected — otherwise delete it manually.", lock_path.display());
             } else {
-                log::info!("Removed stale execution journal lock `{}`.", lock_path.display());
+                log::info!(
+                    "Removed stale execution journal lock `{}`.",
+                    lock_path.display()
+                );
             }
         }
         ensure_durable_file_exists(&config.execution_journal_path).await?;
@@ -782,7 +778,6 @@ struct ConnectedJitoClient {
     next_tip_account: usize,
 }
 
-
 #[allow(dead_code)]
 impl ConnectedJitoClient {
     async fn connect(config: &JitoExecutorConfig) -> Result<Self, JitoExecutionError> {
@@ -910,29 +905,42 @@ impl ConnectedJitoClient {
             VersionedMessage::Legacy(m) => m.recent_blockhash,
             VersionedMessage::V0(m) => m.recent_blockhash,
         };
-        
-        let signed_pump_tx = VersionedTransaction::try_new(message, &[payer])
-            .map_err(|error| JitoExecutionError::TransactionSigning(format!("Pump tx sign error: {error}")))?;
-            
-        let pump_signature = signed_pump_tx.signatures.first()
+
+        let signed_pump_tx = VersionedTransaction::try_new(message, &[payer]).map_err(|error| {
+            JitoExecutionError::TransactionSigning(format!("Pump tx sign error: {error}"))
+        })?;
+
+        let pump_signature = signed_pump_tx
+            .signatures
+            .first()
             .map(ToString::to_string)
-            .ok_or_else(|| JitoExecutionError::TransactionSigning("No signature on Pump tx".into()))?;
-            
+            .ok_or_else(|| {
+                JitoExecutionError::TransactionSigning("No signature on Pump tx".into())
+            })?;
+
         let pump_packet = transaction_to_proto_packet(&signed_pump_tx)?;
-        
+
         let tip_account = self.take_tip_account()?;
-        let tip_instruction = system_instruction::transfer(&payer.pubkey(), &tip_account, tip_lamports);
-        let tip_message = v0::Message::try_compile(&payer.pubkey(), &[tip_instruction], &[], pump_blockhash)
-            .map_err(|error| JitoExecutionError::MessageCompilation(format!("Tip compilation error: {error}")))?;
-            
+        let tip_instruction =
+            system_instruction::transfer(&payer.pubkey(), &tip_account, tip_lamports);
+        let tip_message =
+            v0::Message::try_compile(&payer.pubkey(), &[tip_instruction], &[], pump_blockhash)
+                .map_err(|error| {
+                    JitoExecutionError::MessageCompilation(format!(
+                        "Tip compilation error: {error}"
+                    ))
+                })?;
+
         let tip_tx = VersionedTransaction::try_new(VersionedMessage::V0(tip_message), &[payer])
-            .map_err(|error| JitoExecutionError::TransactionSigning(format!("Tip sign error: {error}")))?;
-            
+            .map_err(|error| {
+                JitoExecutionError::TransactionSigning(format!("Tip sign error: {error}"))
+            })?;
+
         let tip_packet = transaction_to_proto_packet(&tip_tx)?;
-        
+
         // Estimate fees roughly since we bypass get_fee_for_message to save latency
-        let transaction_fee_lamports = 100_000; 
-        
+        let transaction_fee_lamports = 100_000;
+
         Ok(SignedBundle {
             request: SendBundleRequest {
                 bundle: Some(Bundle {
@@ -978,8 +986,6 @@ impl ConnectedJitoClient {
         })
     }
 }
-
-
 
 pub fn construct_raydium_swap_instruction(
     pool_keys: &RaydiumPoolKeys,
@@ -1127,7 +1133,6 @@ async fn resolve_swap_instructions_for_signal(
         ));
     }
     let dynamic_amount_in = (signal.trade_size_sol * 1_000_000_000.0) as u64;
-
 
     let user_owner = payer.pubkey();
     let user_source_token_account =
@@ -1336,13 +1341,12 @@ pub(crate) async fn resolve_pumpportal_swap(
     config: &JitoExecutorConfig,
     pumpportal_api_key: &Option<String>,
     http_client: &reqwest::Client,
-    rpc_url: &str,
 ) -> Result<VersionedTransaction, JitoExecutionError> {
     ensure_signal_fresh(signal, config.max_signal_age)?;
-    
+
     let priority_fee_lamports = 100_000; // Hardcoded for now to avoid utils issue
     let priority_fee_sol = priority_fee_lamports as f64 / 1_000_000_000.0;
-    
+
     let payload = serde_json::json!({
         "publicKey": payer.pubkey().to_string(),
         "action": "buy",
@@ -1353,29 +1357,38 @@ pub(crate) async fn resolve_pumpportal_swap(
         "priorityFee": priority_fee_sol,
         "pool": "pump"
     });
-    
+
     let url = "https://pumpportal.fun/api/trade-local";
     let mut builder = http_client.post(url).json(&payload);
-    
+
     if let Some(key) = pumpportal_api_key {
         builder = builder.header("x-api-key", key);
     }
 
-    let response = builder.send().await
+    let response = builder
+        .send()
+        .await
         .map_err(|e| JitoExecutionError::QuoteRequest(format!("PumpPortal HTTP error: {e}")))?;
-        
+
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(JitoExecutionError::InvalidQuote(format!("PumpPortal HTTP {status}: {body}")));
+        return Err(JitoExecutionError::InvalidQuote(format!(
+            "PumpPortal HTTP {status}: {body}"
+        )));
     }
-    
-    let bytes = response.bytes().await
+
+    let bytes = response
+        .bytes()
+        .await
         .map_err(|e| JitoExecutionError::QuoteRequest(format!("PumpPortal read error: {e}")))?;
-        
-    let transaction: VersionedTransaction = bincode::deserialize(&bytes)
-        .map_err(|e| JitoExecutionError::InvalidQuote(format!("Failed to deserialize PumpPortal transaction: {e}")))?;
-        
+
+    let transaction: VersionedTransaction = bincode::deserialize(&bytes).map_err(|e| {
+        JitoExecutionError::InvalidQuote(format!(
+            "Failed to deserialize PumpPortal transaction: {e}"
+        ))
+    })?;
+
     Ok(transaction)
 }
 
@@ -1450,7 +1463,6 @@ fn parse_quote_amount(name: &str, value: &str) -> Result<u64, JitoExecutionError
     })
 }
 
-
 fn validate_user_token_account(
     account: &Account,
     name: &'static str,
@@ -1493,7 +1505,13 @@ fn ensure_signal_fresh(
     .map_err(|error| JitoExecutionError::InvalidSignalTimestamp(error.to_string()))?;
     let age_ms = now_ms.saturating_sub(signal.timestamp_ms);
     if Duration::from_millis(age_ms) > max_signal_age {
-        log::error!("DEBUG: age_ms={} max_signal_age={:?} signal_ts={} now_ms={}", age_ms, max_signal_age, signal.timestamp_ms, now_ms);
+        log::error!(
+            "DEBUG: age_ms={} max_signal_age={:?} signal_ts={} now_ms={}",
+            age_ms,
+            max_signal_age,
+            signal.timestamp_ms,
+            now_ms
+        );
         return Err(JitoExecutionError::StaleSignal);
     }
     Ok(())
@@ -1605,7 +1623,8 @@ pub async fn run_whale_execution_consumer(
             alpha_agents_core::tipping::TipDecision::Skip { reason } => {
                 log::warn!(
                     "Execution signal rejected for {}: tip gate reason={:?}",
-                    signal.target_mint, reason
+                    signal.target_mint,
+                    reason
                 );
                 bot_state.unlock_mint(&signal.target_mint).await;
                 continue;
@@ -1614,7 +1633,7 @@ pub async fn run_whale_execution_consumer(
 
         // ---- Phase 4 Build & Sign Once (Section 4.1 step 3) -----------
         let is_pump = signal.target_mint.ends_with("pump");
-        
+
         // Pre-parse the target mint. For Raydium the pool resolution will
         // confirm and overwrite this. For PumpPortal the fallback branch
         // uses this directly. Initialised to the signal mint so that
@@ -1625,7 +1644,7 @@ pub async fn run_whale_execution_consumer(
         let mut destination_ata_rent_lamports = 2_039_280;
         let mut pool_id_str = "pump".to_string();
         let mut pool_keys_opt = None;
-        
+
         let signed_bundle = match resolve_swap_instructions_for_signal(
             &signal,
             rpc_client.as_ref(),
@@ -1639,11 +1658,14 @@ pub async fn run_whale_execution_consumer(
                 destination_ata_rent_lamports = prepared.destination_ata_rent_lamports;
                 pool_id_str = prepared.pool_id;
                 pool_keys_opt = Some(prepared.pool_keys);
-                
+
                 let tip_account = match dispatcher.take_tip_account().await {
                     Some(account) => account,
                     None => {
-                        log::warn!("Execution signal rejected for {}: missing tip accounts", signal.target_mint);
+                        log::warn!(
+                            "Execution signal rejected for {}: missing tip accounts",
+                            signal.target_mint
+                        );
                         bot_state.unlock_mint(&signal.target_mint).await;
                         continue;
                     }
@@ -1656,7 +1678,8 @@ pub async fn run_whale_execution_consumer(
                         continue;
                     }
                 };
-                let alt_accounts: Vec<AddressLookupTableAccount> = prepared.alt.into_iter().collect();
+                let alt_accounts: Vec<AddressLookupTableAccount> =
+                    prepared.alt.into_iter().collect();
                 alpha_agents_core::dispatcher::build_and_sign_bundle_with_alt(
                     prepared.instructions,
                     &payer,
@@ -1664,8 +1687,9 @@ pub async fn run_whale_execution_consumer(
                     tip_lamports,
                     recent_blockhash,
                     &alt_accounts,
-                ).map_err(Into::into)
-            },
+                )
+                .map_err(Into::into)
+            }
             Err(error) => {
                 if is_pump {
                     log::info!("Raydium execution unavailable for {} ({error}). Attempting PumpPortal fallback.", signal.target_mint);
@@ -1675,18 +1699,21 @@ pub async fn run_whale_execution_consumer(
                         &signal_config,
                         &config.pumpportal_api_key,
                         &http_client,
-                        rpc_client.url().as_str()
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(pump_tx) => {
-                            prepared_target_mint = Pubkey::from_str(&signal.target_mint).unwrap_or_default();
+                            prepared_target_mint =
+                                Pubkey::from_str(&signal.target_mint).unwrap_or_default();
                             alpha_agents_core::dispatcher::build_and_sign_pump_bundle(
                                 pump_tx,
                                 &payer,
                                 dispatcher.take_tip_account().await.unwrap(),
                                 tip_lamports,
-                            ).map_err(Into::into)
-                        },
-                        Err(e) => Err(e)
+                            )
+                            .map_err(Into::into)
+                        }
+                        Err(e) => Err(e),
                     }
                 } else {
                     log::warn!("Execution signal rejected before submission: {error}");
@@ -1701,7 +1728,8 @@ pub async fn run_whale_execution_consumer(
             Err(error) => {
                 log::warn!(
                     "Execution signal rejected before signing or transmission for {}: {}",
-                    signal.target_mint, error
+                    signal.target_mint,
+                    error
                 );
                 bot_state.unlock_mint(&signal.target_mint).await;
                 continue;
@@ -1753,7 +1781,8 @@ pub async fn run_whale_execution_consumer(
         {
             log::warn!(
                 "Execution signal rejected during journal reservation for {}: {}",
-                signal.target_mint, error
+                signal.target_mint,
+                error
             );
             bot_state.unlock_mint(&signal.target_mint).await;
             continue;
@@ -1782,8 +1811,9 @@ pub async fn run_whale_execution_consumer(
                 // Register the submitted bundle with the inclusion tracker so
                 // Jito's SubscribeBundleResults stream can verify landing
                 // independently of the RPC-based transaction confirmation below.
-                let mut bundle_landed_rx =
-                    None::<tokio::sync::mpsc::Receiver<alpha_agents_core::bundle_tracker::BundleRecord>>;
+                let mut bundle_landed_rx = None::<
+                    tokio::sync::mpsc::Receiver<alpha_agents_core::bundle_tracker::BundleRecord>,
+                >;
                 let mut bundle_slot = None::<u64>;
                 let mut bundle_region = None::<String>;
                 if let Some(ref tracker) = bundle_tracker {
@@ -1884,7 +1914,7 @@ pub async fn run_whale_execution_consumer(
                 let http_clone = http_client.clone();
                 let token_clone = telegram_bot_token.clone();
                 let chat_clone = telegram_chat_id.clone();
-                
+
                 tokio::spawn(async move {
                     let handoff_result = confirm_and_handoff(
                         &signal_clone,
@@ -1913,7 +1943,7 @@ pub async fn run_whale_execution_consumer(
                                 "[handoff] ✅ Position watcher spawned for {}.",
                                 signal_clone.target_mint
                             );
-                            
+
                             let size_sol = (dynamic_amount_in as f64) / 1_000_000_000.0;
                             db::log_trade_telemetry(
                                 &signal_clone.whale_wallet,
@@ -1923,11 +1953,8 @@ pub async fn run_whale_execution_consumer(
                                 0.0,
                                 "LANDED",
                             );
-                            
-                            if let (Some(bot_token), Some(chat_id)) = (
-                                token_clone,
-                                chat_clone,
-                            ) {
+
+                            if let (Some(bot_token), Some(chat_id)) = (token_clone, chat_clone) {
                                 let client_clone = http_clone;
                                 let mint_str = signal_clone.target_mint.clone();
                                 let sig_str = tx_signature_clone.clone();
@@ -1938,12 +1965,13 @@ pub async fn run_whale_execution_consumer(
                                         &bot_token,
                                         &chat_id,
                                         &mint_str,
-                                        1.0, 
-                                        "Bot Execution", 
+                                        1.0,
+                                        "Bot Execution",
                                         &sig_str,
                                         "LANDED ON-CHAIN ✅",
                                         &trade_size,
-                                    ).await;
+                                    )
+                                    .await;
                                 });
                             }
                         }
@@ -1952,7 +1980,9 @@ pub async fn run_whale_execution_consumer(
                                 "[handoff] 🚨 HANDOFF FAILED for {} (sig={}): {}. \
                                  Position may be open without an exit watcher. \
                                  MANUAL REVIEW REQUIRED.",
-                                signal_clone.target_mint, tx_signature_clone, error
+                                signal_clone.target_mint,
+                                tx_signature_clone,
+                                error
                             );
                         }
                     }
@@ -1961,7 +1991,8 @@ pub async fn run_whale_execution_consumer(
             Err(error) => {
                 log::warn!(
                     "Jito bundle submission failed for {}: {}",
-                    signal.target_mint, error
+                    signal.target_mint,
+                    error
                 );
                 // Do not blindly retry an ambiguous submission: the Block Engine may
                 // have accepted it before the response was lost.
@@ -2054,7 +2085,7 @@ async fn confirm_and_handoff(
             &user_destination_token_account,
             target_mint,
             user_owner,
-        )
+        ),
     )
     .await
     .map_err(|_| {
@@ -2085,7 +2116,6 @@ async fn confirm_and_handoff(
     // precision loss.
     let position = ActivePosition {
         mint: signal.target_mint.clone(),
-        whale_wallet: signal.whale_wallet.clone(),
         source_pool_id: pool_id.clone(),
         pool_keys,
         entry_price_wsol_num: dynamic_amount_in as u128,
@@ -2141,7 +2171,8 @@ async fn confirm_and_handoff(
                 Err(broadcast::error::RecvError::Lagged(count)) => {
                     log::warn!(
                         "[handoff] ⚠️  Exit price feed lagged by {} events for pool {}.",
-                        count, pool_id_filter
+                        count,
+                        pool_id_filter
                     );
                     // Continue receiving; the watcher handles staleness.
                 }
@@ -2155,7 +2186,16 @@ async fn confirm_and_handoff(
 
     // ---- Spawn the exit watcher --------------------------------------------
     exits::spawn_position_watcher(
-        position, watcher_rx, rpc_client, payer, bot_state, permit, dry_run, http_client, telegram_bot_token, telegram_chat_id,
+        position,
+        watcher_rx,
+        rpc_client,
+        payer,
+        bot_state,
+        permit,
+        dry_run,
+        http_client,
+        telegram_bot_token,
+        telegram_chat_id,
     );
 
     Ok(())
@@ -2188,7 +2228,9 @@ async fn poll_transaction_confirmation(
                 if poll >= CONFIRMATION_MAX_POLLS / 2 {
                     log::warn!(
                         "[handoff] ⚠️  Confirmation RPC error on poll {}/{}: {}",
-                        poll, CONFIRMATION_MAX_POLLS, err
+                        poll,
+                        CONFIRMATION_MAX_POLLS,
+                        err
                     );
                 }
             }
@@ -2263,19 +2305,7 @@ async fn read_token_account_balance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alpha_agents_core::{
-        shadow_logger::{
-            initialize_shadow_candidate_writer, ShadowCandidateMetrics, ShadowRunId,
-            SHADOW_CANDIDATE_QUEUE_CAPACITY,
-        },
-        types::VwapBaseline,
-    };
-    use rusqlite::Connection;
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::atomic::{AtomicUsize as TestAtomicUsize, Ordering as TestOrdering},
-    };
+    use std::path::PathBuf;
 
     /// Test-only sentinel matching the exact example from the Jito docs
     /// (https://docs.jito.wtf/lowlatencytxnsend/#sandwich-mitigation,
@@ -2305,159 +2335,6 @@ mod tests {
             market_quote_vault: Pubkey::new_unique(),
             market_vault_signer: Pubkey::new_unique(),
         }
-    }
-
-    static SHUTDOWN_TEST_SEQUENCE: TestAtomicUsize = TestAtomicUsize::new(0);
-
-    fn external_shutdown_test_directory(candidate_count: usize) -> PathBuf {
-        let sequence = SHUTDOWN_TEST_SEQUENCE.fetch_add(1, TestOrdering::Relaxed);
-        let directory = std::env::temp_dir().join(format!(
-            "alphanexus-idle-shutdown-{}-{candidate_count}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir(&directory).expect("create isolated shutdown test directory");
-        directory
-    }
-
-    fn shutdown_test_signal(index: u64) -> WhaleSignal {
-        WhaleSignal {
-            target_mint: format!("mint-{index}"),
-            source_pool_id: format!("pool-{index}"),
-            vwap_baseline: VwapBaseline {
-                quote_sum: u128::from(index) + 10,
-                base_sum: u128::from(index) + 20,
-            },
-            timestamp_ms: index + 100,
-        }
-    }
-
-    async fn wait_for_metric(predicate: impl Fn() -> bool) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !predicate() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("metric condition reached within five seconds");
-    }
-
-    async fn assert_idle_shadow_shutdown(candidate_count: usize) {
-        let directory = external_shutdown_test_directory(candidate_count);
-        let configured_path = directory.join("shadow.db");
-        let metrics = Arc::new(ShadowCandidateMetrics::default());
-        let writer = initialize_shadow_candidate_writer(
-            &configured_path,
-            ShadowRunId {
-                started_at_ms: 7,
-                process_id: 11,
-            },
-            metrics.clone(),
-        )
-        .expect("initialize real shadow writer");
-        let database_path = writer.database_path().to_path_buf();
-
-        let (candidate_tx, candidate_rx) =
-            crossbeam::channel::bounded(SHADOW_CANDIDATE_QUEUE_CAPACITY);
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut workers = tokio::task::JoinSet::<Result<&'static str, String>>::new();
-
-        workers.spawn_blocking(move || {
-            writer
-                .run(candidate_rx)
-                .map(|()| "writer")
-                .map_err(|error| format!("writer failed: {error}"))
-        });
-
-        let consumer_metrics = metrics.clone();
-        let consumer_abort_handle = workers.spawn(async move {
-            run_shadow_candidate_consumer(signal_rx, candidate_tx, consumer_metrics)
-                .await
-                .map(|()| "consumer")
-        });
-
-        wait_for_metric(|| {
-            metrics.writer_started.load(Ordering::Acquire)
-                && metrics.consumer_started.load(Ordering::Acquire)
-        })
-        .await;
-
-        for index in 0..candidate_count {
-            signal_tx
-                .send(shutdown_test_signal(
-                    u64::try_from(index).expect("test index fits u64"),
-                ))
-                .expect("execution signal receiver remains open");
-        }
-        wait_for_metric(|| {
-            metrics.candidates_enqueued.load(Ordering::Acquire)
-                == u64::try_from(candidate_count).expect("test count fits u64")
-        })
-        .await;
-
-        // The sender remains open and the consumer has no await point other
-        // than recv(). Once it is rescheduled after the final enqueue, a live
-        // task can only be parked on signal_rx.recv().await.
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-        assert!(!consumer_abort_handle.is_finished());
-
-        workers.abort_all();
-        let (consumer_cancelled, writer_returned) =
-            tokio::time::timeout(Duration::from_secs(5), async {
-                let mut consumer_cancelled = false;
-                let mut writer_returned = false;
-                while let Some(outcome) = workers.join_next().await {
-                    match outcome {
-                        Err(join_error) if join_error.is_cancelled() => {
-                            consumer_cancelled = true;
-                        }
-                        Ok(Ok("writer")) => writer_returned = true,
-                        Ok(Ok(other)) => panic!("unexpected worker completion: {other}"),
-                        Ok(Err(error)) => panic!("worker returned fatal error: {error}"),
-                        Err(join_error) => panic!("worker join failed: {join_error}"),
-                    }
-                }
-                (consumer_cancelled, writer_returned)
-            })
-            .await
-            .expect("complete JoinSet drain must not hang");
-
-        assert!(consumer_cancelled);
-        assert!(writer_returned);
-        assert!(workers.is_empty());
-        assert!(metrics.writer_channel_closed.load(Ordering::Acquire));
-        assert!(metrics.wal_checkpoint_completed.load(Ordering::Acquire));
-        assert!(metrics.shadow_db_healthy.load(Ordering::Acquire));
-        assert_eq!(
-            metrics.candidates_persisted.load(Ordering::Acquire),
-            u64::try_from(candidate_count).expect("test count fits u64")
-        );
-
-        let row_count: i64 = {
-            let connection = Connection::open(&database_path).expect("reopen shadow database");
-            connection
-                .query_row("SELECT COUNT(*) FROM shadow_trade_candidates", [], |row| {
-                    row.get(0)
-                })
-                .expect("count persisted shadow candidates")
-        };
-        assert_eq!(
-            row_count,
-            i64::try_from(candidate_count).expect("test count fits i64")
-        );
-
-        drop(signal_tx);
-        fs::remove_dir_all(directory).expect("remove shutdown test directory");
-    }
-
-    #[tokio::test]
-    async fn idle_shadow_shutdown_drains_empty_candidate_queue() {
-        assert_idle_shadow_shutdown(0).await;
-    }
-
-    #[tokio::test]
-    async fn idle_shadow_shutdown_drains_populated_candidate_queue() {
-        assert_idle_shadow_shutdown(2).await;
     }
 
     #[test]
@@ -2540,17 +2417,6 @@ mod tests {
             construct_raydium_swap_instruction(&pool, owner, pool.base_vault, destination, 1, 1,),
             Err(JitoExecutionError::InvalidSwapAccount(_))
         ));
-    }
-
-    #[test]
-    fn worst_case_quote_must_still_meet_trigger() {
-        let baseline = alpha_agents_core::types::VwapBaseline {
-            quote_sum: 1_000,
-            base_sum: 100,
-        };
-
-        assert!(quote_still_meets_trigger(850, 100, baseline).expect("checked arithmetic"));
-        assert!(!quote_still_meets_trigger(851, 100, baseline).expect("checked arithmetic"));
     }
 
     #[test]

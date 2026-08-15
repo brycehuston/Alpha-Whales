@@ -110,7 +110,7 @@ impl TipTelemetryEngine {
 
     async fn refresh_loop_inner(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let client = reqwest::Client::new();
-        
+
         // Initial fetch before entering the sleep loop
         let result = self.fetch_telemetry(&client).await;
         match result {
@@ -133,7 +133,7 @@ impl TipTelemetryEngine {
                 log::warn!("Tip telemetry initial refresh failed: {error}");
             }
         }
-        
+
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
@@ -199,7 +199,7 @@ impl TipTelemetryEngine {
                 poison.into_inner()
             }
         };
-        
+
         let telemetry = match *telemetry_guard {
             Some(t) => t,
             None => {

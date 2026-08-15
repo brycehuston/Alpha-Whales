@@ -26,5 +26,3 @@ pub struct WhaleSignal {
     pub timestamp_ms: u64,
     pub lane: crate::config::WhaleLane,
 }
-
-

@@ -1,5 +1,5 @@
-use std::{env, collections::HashMap, sync::Arc};
 use dashmap::DashMap;
+use std::{collections::HashMap, env, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShadowStartupPolicy {
@@ -79,8 +79,6 @@ pub struct AppConfig {
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
     pub pumpportal_api_key: Option<String>,
-    #[expect(dead_code, reason = "reserved for Phase 3+ runtime mode checks")]
-    pub dry_run: bool,
     pub startup_policy: ShadowStartupPolicy,
     pub watchlist: Arc<DashMap<String, WhaleProfile>>,
 }
@@ -132,7 +130,9 @@ impl AppConfig {
             .filter(|s| !s.is_empty());
         let telegram_chat_id = env::var("TELEGRAM_CHAT_ID").ok().filter(|s| !s.is_empty());
 
-        let pumpportal_api_key = env::var("PUMPPORTAL_API_KEY").ok().filter(|s| !s.is_empty());
+        let pumpportal_api_key = env::var("PUMPPORTAL_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         if telegram_bot_token.is_none() || telegram_chat_id.is_none() {
             println!("⚠️  TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — alerts disabled.");
@@ -158,7 +158,10 @@ impl AppConfig {
         }
 
         let watchlist = Self::load_csv_watchlist("approved_watchlist.csv");
-        log::info!("Loaded {} approved whale wallets into memory", watchlist.len());
+        log::info!(
+            "Loaded {} approved whale wallets into memory",
+            watchlist.len()
+        );
 
         let watchlist_arc = Arc::new(watchlist.into_iter().collect::<DashMap<_, _>>());
 
@@ -183,7 +186,6 @@ impl AppConfig {
             telegram_bot_token,
             telegram_chat_id,
             pumpportal_api_key,
-            dry_run,
             startup_policy,
             watchlist: watchlist_arc,
         })
@@ -193,7 +195,9 @@ impl AppConfig {
         let mut watchlist = HashMap::new();
         if let Ok(content) = std::fs::read_to_string(path) {
             for (i, line) in content.lines().enumerate() {
-                if i == 0 || line.trim().is_empty() { continue; } // skip header and empty
+                if i == 0 || line.trim().is_empty() {
+                    continue;
+                } // skip header and empty
                 let parts: Vec<&str> = line.split(',').collect();
                 if parts.len() >= 5 {
                     let wallet = parts[0].trim().to_string();
@@ -201,7 +205,7 @@ impl AppConfig {
                     let win_rate = parts[2].parse::<f64>().unwrap_or(0.0);
                     let profit_factor = parts[3].parse::<f64>().unwrap_or(0.0);
                     let net_profit = parts[4].parse::<f64>().unwrap_or(0.0);
-                    
+
                     let lane_str = if parts.len() > 5 { parts[5].trim() } else { "" };
                     let lane = match lane_str {
                         "Conservative" => WhaleLane::Conservative,
@@ -220,13 +224,16 @@ impl AppConfig {
                         }
                     };
 
-                    watchlist.insert(wallet, WhaleProfile {
-                        total_trades,
-                        win_rate,
-                        profit_factor,
-                        net_profit,
-                        lane,
-                    });
+                    watchlist.insert(
+                        wallet,
+                        WhaleProfile {
+                            total_trades,
+                            win_rate,
+                            profit_factor,
+                            net_profit,
+                            lane,
+                        },
+                    );
                 }
             }
         }
@@ -237,10 +244,10 @@ impl AppConfig {
 pub async fn spawn_hot_reloader(watchlist_arc: Arc<DashMap<String, WhaleProfile>>, path: String) {
     log::info!("Starting Hot Reloader for {}", path);
     let mut last_modified = std::time::SystemTime::UNIX_EPOCH;
-    
+
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-        
+
         if let Ok(metadata) = std::fs::metadata(&path) {
             if let Ok(modified) = metadata.modified() {
                 if modified > last_modified {
@@ -248,12 +255,15 @@ pub async fn spawn_hot_reloader(watchlist_arc: Arc<DashMap<String, WhaleProfile>
                     if last_modified != std::time::SystemTime::UNIX_EPOCH {
                         log::info!("[Hot-Reload] Detected changes in {}. Reloading...", path);
                         let new_watchlist = AppConfig::load_csv_watchlist(&path);
-                        
+
                         watchlist_arc.clear();
                         for (k, v) in new_watchlist {
                             watchlist_arc.insert(k, v);
                         }
-                        log::info!("[Hot-Reload] Watchlist updated from disk! Loaded {} whales.", watchlist_arc.len());
+                        log::info!(
+                            "[Hot-Reload] Watchlist updated from disk! Loaded {} whales.",
+                            watchlist_arc.len()
+                        );
                     }
                     last_modified = modified;
                 }

@@ -71,8 +71,7 @@ pub fn transaction_to_proto_packet(
     }
 
     let size = u64::try_from(data.len())
-        .map_err(|e| BundleError::TransactionSerialization(format!("length cast failed: {e}")))?
-    ;
+        .map_err(|e| BundleError::TransactionSerialization(format!("length cast failed: {e}")))?;
     Ok(ProtoPacket {
         data,
         meta: Some(ProtoMeta {
@@ -491,27 +490,38 @@ pub fn build_and_sign_pump_bundle(
         solana_sdk::message::VersionedMessage::Legacy(m) => m.recent_blockhash,
         solana_sdk::message::VersionedMessage::V0(m) => m.recent_blockhash,
     };
-    
+
     let signed_pump_tx = VersionedTransaction::try_new(message, &[payer])
         .map_err(|e| BundleError::TransactionSigning(format!("Pump sign error: {e}")))?;
-        
-    let pump_signature = signed_pump_tx.signatures.first()
+
+    let pump_signature = signed_pump_tx
+        .signatures
+        .first()
         .map(ToString::to_string)
         .ok_or_else(|| BundleError::TransactionSigning("No signature on Pump tx".into()))?;
-        
+
     let pump_packet = transaction_to_proto_packet(&signed_pump_tx)?;
-        
-    let tip_instruction = solana_sdk::system_instruction::transfer(&payer.pubkey(), &tip_account, tip_lamports);
-    let tip_message = solana_sdk::message::v0::Message::try_compile(&payer.pubkey(), &[tip_instruction], &[], pump_blockhash)
-        .map_err(|e| BundleError::MessageCompilation(format!("Tip compilation error: {e}")))?;
-        
-    let tip_tx = VersionedTransaction::try_new(solana_sdk::message::VersionedMessage::V0(tip_message), &[payer])
-        .map_err(|e| BundleError::TransactionSigning(format!("Tip sign error: {e}")))?;
-        
+
+    let tip_instruction =
+        solana_sdk::system_instruction::transfer(&payer.pubkey(), &tip_account, tip_lamports);
+    let tip_message = solana_sdk::message::v0::Message::try_compile(
+        &payer.pubkey(),
+        &[tip_instruction],
+        &[],
+        pump_blockhash,
+    )
+    .map_err(|e| BundleError::MessageCompilation(format!("Tip compilation error: {e}")))?;
+
+    let tip_tx = VersionedTransaction::try_new(
+        solana_sdk::message::VersionedMessage::V0(tip_message),
+        &[payer],
+    )
+    .map_err(|e| BundleError::TransactionSigning(format!("Tip sign error: {e}")))?;
+
     let tip_packet = transaction_to_proto_packet(&tip_tx)?;
-        
-    let transaction_fee_lamports = 100_000; 
-    
+
+    let transaction_fee_lamports = 100_000;
+
     Ok(SignedBundle {
         request: SendBundleRequest {
             bundle: Some(Bundle {
@@ -563,9 +573,7 @@ pub fn build_and_sign_bundle_with_alt(
         .first()
         .map(ToString::to_string)
         .ok_or_else(|| {
-            BundleError::TransactionSigning(
-                "signed transaction contained no signature".to_string(),
-            )
+            BundleError::TransactionSigning("signed transaction contained no signature".to_string())
         })?;
 
     let packet = transaction_to_proto_packet(&transaction)?;

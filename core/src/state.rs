@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, Mutex as TokioMutex};
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
 // ============================================================================
 // MAX_CONCURRENT_POSITIONS — Open Position Concurrency Cap
@@ -36,7 +36,6 @@ pub const MAX_CONCURRENT_POSITIONS: usize = 3;
 
 /// Accepted shadow positions retain their capacity for the same four-hour
 /// window used by the duplicate-mint guard.
-#[expect(dead_code, reason = "will be used by Phase 4 shadow-position tracking")]
 pub const SHADOW_POSITION_TTL_MS: u64 = 4 * 60 * 60 * 1000;
 
 /// How long the circuit breaker blocks new trades after tripping.
@@ -48,7 +47,6 @@ const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const CIRCUIT_BREAKER_THRESHOLD: usize = 3;
 
 struct ShadowPosition {
-    #[expect(dead_code, reason = "will be used by Phase 4 expiry pruning")]
     opened_at_ms: u64,
     _position_permit: OwnedSemaphorePermit,
 }
@@ -77,10 +75,6 @@ pub struct BotState {
     circuit_breaker_tripped_at: TokioMutex<Option<Instant>>,
 }
 
-#[expect(
-    dead_code,
-    reason = "shadow-position methods reserved for Phase 4 tracking"
-)]
 impl BotState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {

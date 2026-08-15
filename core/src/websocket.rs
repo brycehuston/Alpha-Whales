@@ -37,8 +37,27 @@ pub static DECODE_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static FILTER_DROPS: AtomicU64 = AtomicU64::new(0);
 pub static WS_QUEUE_FULL_DROPS: AtomicU64 = AtomicU64::new(0);
 
-
 type HeliusSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+fn build_subscription_request(wallets: &[&str]) -> Result<String, BotError> {
+    let account_include = wallets
+        .iter()
+        .map(|wallet| {
+            Pubkey::from_str(wallet).map_err(|error| {
+                BotError::ConfigError(format!(
+                    "approved_watchlist.csv contains invalid wallet `{wallet}`: {error}"
+                ))
+            })?;
+            Ok(format!("\"{wallet}\""))
+        })
+        .collect::<Result<Vec<_>, BotError>>()?
+        .join(", ");
+
+    Ok(format!(
+        r#"{{"jsonrpc": "2.0", "id": 1, "method": "transactionSubscribe", "params": [{{"vote": false, "failed": false, "accountInclude": [{}]}}, {{"commitment": "processed", "encoding": "jsonParsed", "transactionDetails": "full", "showRewards": false, "maxSupportedTransactionVersion": 0}}]}}"#,
+        account_include
+    ))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DecodedSwap {
@@ -710,28 +729,29 @@ pub async fn run_listener(
         ));
     }
 
-    let watchlist_content = std::fs::read_to_string("approved_watchlist.csv")
-        .map_err(|e| BotError::ConfigError(format!("Failed to read approved_watchlist.csv: {}", e)))?;
-    
+    let watchlist_content = std::fs::read_to_string("approved_watchlist.csv").map_err(|e| {
+        BotError::ConfigError(format!("Failed to read approved_watchlist.csv: {}", e))
+    })?;
+
     let mut wallets = Vec::new();
     for (i, line) in watchlist_content.lines().enumerate() {
-        if i == 0 { continue; } // Skip header
+        if i == 0 {
+            continue;
+        }
         if let Some(wallet) = line.split(',').next() {
             if !wallet.trim().is_empty() {
-                wallets.push(format!("\"{}\"", wallet.trim()));
+                wallets.push(wallet.trim());
             }
         }
     }
-    
+
     if wallets.is_empty() {
-        return Err(BotError::ConfigError("approved_watchlist.csv is empty or invalid".to_string()));
+        return Err(BotError::ConfigError(
+            "approved_watchlist.csv is empty or invalid".to_string(),
+        ));
     }
-    
-    let account_include = wallets.join(", ");
-    let subscription_request = format!(
-        r#"{{"jsonrpc": "2.0", "id": 1, "method": "transactionSubscribe", "params": [{{"vote": false, "failed": false, "accountInclude": [{}]}}, {{"commitment": "processed", "encoding": "jsonParsed", "transactionDetails": "full", "showRewards": false, "maxSupportedTransactionVersion": 0}}]}}"#,
-        account_include
-    );
+
+    let subscription_request = build_subscription_request(&wallets)?;
 
     loop {
         log::info!("Connecting to Helius Raydium transaction stream");
@@ -745,14 +765,15 @@ pub async fn run_listener(
         };
 
         let (mut write, mut read) = ws_stream.split();
-        let subscription_id = match subscribe_and_wait_for_ack(&mut write, &mut read, &subscription_request).await {
-            Ok(subscription_id) => subscription_id,
-            Err(error) => {
-                log::warn!("Helius subscription handshake failed: {error}; reconnecting");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-        };
+        let subscription_id =
+            match subscribe_and_wait_for_ack(&mut write, &mut read, &subscription_request).await {
+                Ok(subscription_id) => subscription_id,
+                Err(error) => {
+                    log::warn!("Helius subscription handshake failed: {error}; reconnecting");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
         STREAM_EPOCH.fetch_add(1, Ordering::Relaxed);
         log::info!("Helius Raydium transaction subscription active: {subscription_id}");
 
@@ -888,11 +909,12 @@ mod tests {
             min_swap_lamports: 0,
             telegram_bot_token: None,
             telegram_chat_id: None,
-            dry_run: true,
+            pumpportal_api_key: None,
             startup_policy: crate::config::ShadowStartupPolicy {
                 position_recovery_allowed: false,
                 capital_execution_allowed: false,
             },
+            watchlist: std::sync::Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -1019,10 +1041,17 @@ mod tests {
 
     #[test]
     fn subscription_payload_is_exactly_approved_json_rpc() {
+        let request = build_subscription_request(&["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"])
+            .expect("valid wallet builds a subscription");
         assert_eq!(
-            SUBSCRIPTION_REQUEST,
+            request,
             r#"{"jsonrpc": "2.0", "id": 1, "method": "transactionSubscribe", "params": [{"vote": false, "failed": false, "accountInclude": ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"]}, {"commitment": "processed", "encoding": "jsonParsed", "transactionDetails": "full", "showRewards": false, "maxSupportedTransactionVersion": 0}]}"#
         );
+    }
+
+    #[test]
+    fn subscription_payload_rejects_invalid_wallet() {
+        assert!(build_subscription_request(&["not-a-solana-pubkey"]).is_err());
     }
 
     #[test]
@@ -1045,6 +1074,10 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_sends_exact_payload_and_ignores_ping_before_ack() {
+        let subscription_request =
+            build_subscription_request(&["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"])
+                .expect("valid wallet builds a subscription");
+        let expected_request = subscription_request.clone();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback listener");
@@ -1062,7 +1095,7 @@ mod tests {
                 .expect("valid subscription frame");
             assert_eq!(
                 request.into_text().expect("subscription request is text"),
-                SUBSCRIPTION_REQUEST
+                expected_request
             );
 
             socket
@@ -1090,7 +1123,7 @@ mod tests {
             .expect("connect loopback WebSocket");
         let (mut write, mut read) = socket.split();
         assert_eq!(
-            subscribe_and_wait_for_ack(&mut write, &mut read)
+            subscribe_and_wait_for_ack(&mut write, &mut read, &subscription_request)
                 .await
                 .expect("valid subscription ACK"),
             77
@@ -1336,36 +1369,6 @@ mod tests {
         assert_eq!(STREAM_EPOCH.load(Ordering::Relaxed), 501);
         assert_eq!(
             WS_QUEUE_FULL_DROPS.load(Ordering::Relaxed),
-            drops_before + 1
-        );
-        STREAM_EPOCH.store(0, Ordering::Relaxed);
-    }
-
-    #[test]
-    fn queued_event_retains_stamp_when_math_drop_advances_shared_epoch() {
-        let _guard = EPOCH_TEST_LOCK.lock().expect("epoch test lock");
-        STREAM_EPOCH.store(700, Ordering::Relaxed);
-        let fixture = notification_fixture(
-            CURRENT_SWAP_ACCOUNT_COUNT,
-            RAYDIUM_SWAP_BASE_IN,
-            InstructionLocation::Outer,
-            false,
-        );
-        let decoded = decode_fixture(&fixture, 1)
-            .expect("fixture decodes")
-            .pop()
-            .expect("one swap");
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        enqueue_decoded_swap(decoded, &tx, &test_config()).expect("queue accepts event");
-        let event = rx.try_recv().expect("stamped event");
-        let drops_before = MATH_QUEUE_FULL_DROPS.load(Ordering::Relaxed);
-
-        record_math_queue_full_drop();
-
-        assert_eq!(event.stream_epoch, 700);
-        assert_eq!(STREAM_EPOCH.load(Ordering::Relaxed), 701);
-        assert_eq!(
-            MATH_QUEUE_FULL_DROPS.load(Ordering::Relaxed),
             drops_before + 1
         );
         STREAM_EPOCH.store(0, Ordering::Relaxed);

@@ -1,6 +1,27 @@
-# Alpha Whales Changelog
+# Alpha Agents Changelog
 
 All notable changes to this project will be documented in this file.
+
+## [WORKSPACE-STABILIZATION] - 2026-08-04
+
+### Fixed
+- Restored the active Cargo workspace to a zero-warning state across all targets and repaired WebSocket subscription tests against the runtime payload builder.
+- Made watchlist subscription construction reject malformed Solana wallet addresses before opening a Helius stream.
+- Preserved the Helius on-chain event time in whale signals by converting the documented Unix-seconds webhook timestamp to milliseconds; delayed delivery can no longer reset signal freshness to local receipt time.
+
+### Removed
+- Deleted dismantled VWAP/shadow test remnants, the unused strategy trait, the unexported shadow logger, and an uncalled priority-fee helper.
+- Removed unused direct dependencies and inactive position metadata.
+- Deleted standalone Telegram, wallet-balance, and PumpPortal diagnostics containing exposed credentials or live-request hazards.
+- Removed the tracked stale execution-journal lock and added it to local runtime ignores.
+
+### Security
+- Removed tracked wallet, Helius, and Telegram credential literals from the working tree. The exposed wallet and service credentials must be rotated because public Git history retains them.
+
+### Validation
+- `cargo check --workspace --all-targets --offline`
+- `cargo test --workspace --offline` — 92 passed, 0 failed.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings`
 
 ## [EXECUTION-CRITICAL-FIX] - 2026-08-03
 ### Fixed

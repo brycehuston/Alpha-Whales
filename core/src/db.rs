@@ -12,13 +12,14 @@ pub fn init_db() -> Result<(), String> {
     log::info!("[db] init_db: opening trade_telemetry.db");
     let conn = Connection::open("trade_telemetry.db")
         .map_err(|e| format!("Failed to open trade_telemetry.db: {e}"))?;
-    
+
     // AUDIT FIX: MEDIUM — SQLite Hygiene
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
-         PRAGMA busy_timeout = 5000;"
-    ).map_err(|e| format!("Failed to configure SQLite PRAGMAs: {e}"))?;
-    
+         PRAGMA busy_timeout = 5000;",
+    )
+    .map_err(|e| format!("Failed to configure SQLite PRAGMAs: {e}"))?;
+
     log::info!("[db] init_db: connection opened successfully");
 
     // -- Phase 5 tables -------------------------------------------------------
@@ -335,7 +336,13 @@ pub fn record_landed_bundle(
         ";
         if let Err(e) = conn.execute(
             sql,
-            params![bundle_id, region, token_mint, transaction_signature, landed_slot],
+            params![
+                bundle_id,
+                region,
+                token_mint,
+                transaction_signature,
+                landed_slot
+            ],
         ) {
             log::error!("failed to record landed bundle: {e}");
         }
@@ -394,10 +401,17 @@ pub fn record_position(
         if let Err(e) = conn.execute(
             sql,
             params![
-                token_mint, bundle_id, region, slot, transaction_signature,
-                amount_in_lamports, acquired_amount_raw,
-                entry_price_num_i64, entry_price_den_i64,
-                tip_lamports, pool_id,
+                token_mint,
+                bundle_id,
+                region,
+                slot,
+                transaction_signature,
+                amount_in_lamports,
+                acquired_amount_raw,
+                entry_price_num_i64,
+                entry_price_den_i64,
+                tip_lamports,
+                pool_id,
             ],
         ) {
             log::error!("failed to record position: {e}");

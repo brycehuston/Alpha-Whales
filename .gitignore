@@ -12,6 +12,7 @@ Cargo.lock
 *.log
 trade_telemetry.db
 execution_journal.log
+execution_journal.log.lock
 
 # OS generated files
 .DS_Store
@@ -21,3 +22,4 @@ execution_journal.log
 .Trashes
 ehthumbs.db
 Thumbs.db
+desktop.ini

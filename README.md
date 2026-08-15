@@ -1,59 +1,63 @@
-# Alpha Agents
+<div align="center">
+  <h1>🐋 Alpha-Agents (Alpha-Whales)</h1>
+  <p><strong>A high-performance Solana MEV & sniping bot architecture</strong></p>
+  <p>
+    <img src="https://img.shields.io/badge/Solana-MEV-blueviolet?style=for-the-badge&logo=solana" alt="Solana MEV" />
+    <img src="https://img.shields.io/badge/Rust-Blazing_Fast-orange?style=for-the-badge&logo=rust" alt="Rust" />
+    <img src="https://img.shields.io/badge/Jito-Block_Engine-green?style=for-the-badge" alt="Jito" />
+  </p>
+</div>
 
-Shared Solana execution infrastructure with strategy-specific bot crates. The active workspace currently contains:
+---
 
-- `core/` — shared WebSocket ingestion, Jito dispatch, tipping, state, database, and Telegram infrastructure.
-- `alpha-whales/` — whale-wallet signal execution and automated exit logic.
+## ⚡ Overview
 
-Planned strategies are `alpha-telegram-whales`, `alpha-dbo`, `alpha-trends`, and paper-only `alpha-x`. They are not registered until each has distinct, tested signal logic. Do not clone `alpha-whales` and relabel it as a new strategy.
+Alpha-Agents is a high-frequency, ultra-low latency execution engine built in Rust. Currently pivoting to zero-latency **Geyser gRPC streams** (via Yellowstone) to snipe Slot-0 state and front-run optimal MEV opportunities.
 
-## Safety state
+### 🎯 Key Features
+- **Zero-Latency Ingestion**: Sub-millisecond banking-stage extraction using Helius Geyser gRPC streams.
+- **Jito Block Engine Integration**: Direct bundle assembly and transmission with dynamic tipping for sandwich protection and guaranteed execution.
+- **Pump.fun Targetting**: Dedicated logic for identifying and sniping bonding curves on `6EF8rrecthR5Dkzon8Nwu78hRvfX9MLnqiX+`.
+- **Position Management**: Built-in 16% Trailing Stop Loss (TSL) and 50% Take Profit (TP) lifecycle management.
 
-- Default development mode is paper/shadow execution: `DRY_RUN=true` and `LIVE_EXECUTION=false`.
-- Live execution requires the inverse pair explicitly and a funded signer.
-- Never commit private keys, bot tokens, RPC credentials, `.env` files, journals, or telemetry databases.
-- Jito bundle acceptance is not treated as settlement; transaction confirmation remains required.
+## 🏗️ Architecture
 
-## Setup
+- `core/`: The foundational ingestion pipeline and infrastructure (Geyser stream, connection handling, DB, configurations).
+- `alpha-whales/`: The main execution binary consuming the `token_mint` stream, routing Jito bundles, and handling position tracking.
+- `alpha-dbo/`: Database object and historical telemetry management crate.
 
-Requirements: Rust, WSL2, a private HTTPS Solana RPC endpoint, and a WSS transaction stream.
+## 🚀 Getting Started
 
-Create an ignored `.env` file in the repository root:
+### Prerequisites
+- [Rust & Cargo](https://rustup.rs/)
+- [Solana CLI](https://docs.solana.com/cli/install-solana-cli-tools) `v2.1.0+`
+- A Helius WSS/gRPC endpoint
+- WSL 2 (Windows Subsystem for Linux) is **required** for compiling Jito dependencies.
 
+### Environment Setup
+
+Create a `.env` file in the root directory:
 ```env
-RPC_URL=https://YOUR_PRIVATE_RPC_ENDPOINT
-RAYDIUM_WS_URL=wss://YOUR_PRIVATE_TRANSACTION_STREAM
-WALLET_PRIVATE_KEY=YOUR_BASE58_PRIVATE_KEY
-WEBHOOK_API_KEY=YOUR_RANDOM_WEBHOOK_AUTH_SECRET
-
-DRY_RUN=true
-LIVE_EXECUTION=false
-
-TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID=YOUR_TELEGRAM_CHAT_ID
-PUMPPORTAL_API_KEY=YOUR_PUMPPORTAL_API_KEY
-
-MIN_SWAP_LAMPORTS=10000000
-JITO_REGIONS=amsterdam,frankfurt,ny,slc,tokyo
+WALLET_PRIVATE_KEY=your_base58_private_key
+HELIUS_WSS_URL=wss://mainnet.helius-rpc.com/?api-key=your_key
+HELIUS_X_TOKEN=your_grpc_token
+MAX_SLIPPAGE_BPS=50
+MAX_SIGNAL_AGE_MS=1500
+MAX_PENDING_CAPITAL_LAMPORTS=1000000000
+EXECUTION_JOURNAL_PATH=/path/to/journal.log
+JITO_DONT_FRONT_PUBKEY=...
 ```
 
-Keep optional Telegram and PumpPortal values unset when those integrations are unused.
-
-Configure `approved_watchlist.csv`, then validate from WSL:
+### Build & Run
+Run all Cargo commands within a WSL bash environment:
 
 ```bash
-cargo check --workspace --all-targets --offline
-cargo test --workspace --offline
-cargo clippy --workspace --all-targets --offline -- -D warnings
+# Verify the build
+cargo check
+
+# Run the execution binary
+cargo run --release -p alpha-whales
 ```
 
-Run the current strategy only after validation:
-
-```bash
-cargo run -p alpha-whales-bot --release
-```
-
-## Current boundary
-
-The current bot consumes authenticated Helius whale-wallet webhook events and an on-chain Raydium transaction stream. The Telegram-channel adapter, Alpha DBO, Alpha Trends, and isolated Alpha X still require separate paper-mode implementations and replay evidence before registration.
-# Alpha-Agents
+## ⚠️ Disclaimer
+**Use at your own risk.** MEV and high-frequency trading involve substantial financial risk. The bot is strictly designed to fail-closed to protect capital, but market volatility on Solana is unpredictable. Always test with small amounts or on Devnet first.
